@@ -1,8 +1,18 @@
-import type { NextConfig } from "next";
+import type { NextConfig } from 'next'
 
 const nextConfig: NextConfig = {
-  /* config options here */
-  reactCompiler: true,
-};
+  // Allow the frontend to call the FastAPI backend on localhost:8000
+  async rewrites() {
+    return [
+      {
+        source: '/api/:path*',
+        destination: 'http://localhost:8000/:path*',
+      },
+    ]
+  },
 
-export default nextConfig;
+  // Disable strict mode in dev to prevent double SSE connections
+  reactStrictMode: false,
+}
+
+export default nextConfig
