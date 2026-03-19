@@ -6,10 +6,11 @@ import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 from models import VaultResult
-from pypdf import PdfReader
 from typing import Optional
 import os
 import io
+import io
+from pypdf import PdfReader
 import logging
 
 # ─────────────────────────────────────────────
