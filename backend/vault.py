@@ -6,18 +6,21 @@ import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 from models import VaultResult
+from pypdf import PdfReader
 from typing import Optional
 import os
+import io
 import logging
 
 # ─────────────────────────────────────────────
 # CONSTANTS — never hardcode these anywhere else
 # ─────────────────────────────────────────────
-VAULT_PATH          = "./vault_db"
-COLLECTION_NAME     = "ground_truth_vault"
-EMBEDDING_MODEL     = "all-MiniLM-L6-v2"
-N_RESULTS           = 3
-SIMILARITY_THRESHOLD = 0.75   # below this = not confident enough, return None
+VAULT_PATH           = "./vault_db"
+COLLECTION_NAME      = "ground_truth_vault"
+EMBEDDING_MODEL      = "all-MiniLM-L6-v2"
+N_RESULTS            = 3
+SIMILARITY_THRESHOLD = 0.75
+UPLOAD_DIR           = "./uploaded_docs"  # ← NEW: PDFs saved here
 
 # Setup logger
 logging.basicConfig(level=logging.INFO)
@@ -31,10 +34,13 @@ logger = logging.getLogger(__name__)
 class GroundTruthVault:
 
     def __init__(self):
-        self.embedder = None
-        self.client = None
-        self.collection = None
+        self.embedder     = None
+        self.client       = None
+        self.collection   = None
         self._initialized = False
+
+        # NEW — create upload folder automatically on startup
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
     # ───────────────────────────────────────────────────
@@ -71,9 +77,6 @@ class GroundTruthVault:
     # ───────────────────────────────────────────────────
     # METHOD 2 — add_document()
     # Adds ONE verified fact into the vault
-    # text        = the fact e.g. "Apple revenue was $394.3B"
-    # source_name = file it came from e.g. "apple_report.pdf"
-    # chunk_id    = optional custom ID, auto-generated if None
     # ───────────────────────────────────────────────────
     def add_document(
         self,
@@ -82,7 +85,6 @@ class GroundTruthVault:
         chunk_id: Optional[str] = None
     ):
         # Auto-generate a unique ID if none provided
-        # hash(text) % 100000 gives a short unique number
         doc_id = chunk_id or f"{source_name}_{hash(text) % 100000}"
 
         # Convert text to embedding (list of 384 numbers)
@@ -103,8 +105,6 @@ class GroundTruthVault:
     # ───────────────────────────────────────────────────
     # METHOD 3 — add_documents_bulk()
     # Adds MANY facts at once (faster than one by one)
-    # texts       = list of fact strings
-    # source_name = same PDF for all chunks
     # ───────────────────────────────────────────────────
     def add_documents_bulk(self, texts: list[str], source_name: str):
         # Generate IDs for each chunk
@@ -124,11 +124,14 @@ class GroundTruthVault:
             metadatas=metadatas
         )
 
-        logger.info(f"[Vault] Bulk added {len(texts)} facts from {source_name} ✓")
+        logger.info(
+            f"[Vault] Bulk added {len(texts)} facts "
+            f"from {source_name} ✓"
+        )
 
 
     # ───────────────────────────────────────────────────
-    # METHOD 4 — search()  ← MOST IMPORTANT METHOD
+    # METHOD 4 — search() ← MOST IMPORTANT METHOD
     # Called mid-stream for every detected claim
     # Returns the best matching fact OR None if not confident
     # Target: must complete in < 100ms
@@ -159,10 +162,10 @@ class GroundTruthVault:
         best_distance = results["distances"][0][0]
 
         # ChromaDB cosine distance: 0 = identical, 2 = opposite
-        # Convert to similarity score: 1.0 = perfect match, 0.0 = no match
+        # Convert to similarity: 1.0 = perfect, 0.0 = no match
         similarity = 1.0 - (best_distance / 2.0)
 
-        # If similarity is too low → not confident enough → return None
+        # If similarity too low → not confident → return None
         if similarity < SIMILARITY_THRESHOLD:
             logger.info(
                 f"[Vault] No confident match found "
@@ -175,7 +178,6 @@ class GroundTruthVault:
             f"source={best_source}"
         )
 
-        # Return structured VaultResult for Sentinel to use
         return VaultResult(
             matched_text=best_text,
             source_document=best_source,
@@ -195,7 +197,6 @@ class GroundTruthVault:
     # ───────────────────────────────────────────────────
     # METHOD 6 — clear_vault()
     # Wipes all facts and starts fresh
-    # Use carefully — only for testing/reset
     # ───────────────────────────────────────────────────
     def clear_vault(self):
         self.client.delete_collection(COLLECTION_NAME)
@@ -206,6 +207,136 @@ class GroundTruthVault:
         logger.info("[Vault] Vault cleared ✓ — fresh start")
 
 
+    # ───────────────────────────────────────────────────
+    # NEW METHOD 7 — save_pdf_file()
+    # Saves the uploaded PDF physically to disk
+    # Returns the saved file path
+    # ───────────────────────────────────────────────────
+    def save_pdf_file(self, pdf_bytes: bytes, filename: str) -> str:
+        save_path = os.path.join(UPLOAD_DIR, filename)
+
+        with open(save_path, "wb") as f:
+            f.write(pdf_bytes)
+
+        logger.info(f"[Vault] PDF saved to disk → {save_path} ✓")
+        return save_path
+
+
+    # ───────────────────────────────────────────────────
+    # NEW METHOD 8 — extract_chunks_from_pdf()
+    # Reads PDF bytes → returns clean text chunks
+    # Each chunk = one meaningful paragraph
+    # ───────────────────────────────────────────────────
+    def extract_chunks_from_pdf(
+        self,
+        pdf_bytes: bytes,
+        filename: str
+    ) -> list[str]:
+        # Load PDF from memory (no saving to disk needed here)
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        chunks = []
+
+        for page_num, page in enumerate(reader.pages):
+            # Extract raw text from this page
+            text = page.extract_text()
+
+            if not text:
+                continue  # skip empty pages
+
+            # Split page into paragraphs
+            paragraphs = text.split('\n\n')
+
+            for para in paragraphs:
+                # Clean up whitespace and newlines
+                clean = para.strip().replace('\n', ' ')
+
+                # Only keep meaningful chunks (not too short)
+                if len(clean) > 50:
+                    chunks.append(clean)
+
+        logger.info(
+            f"[Vault] Extracted {len(chunks)} chunks "
+            f"from {filename} ({len(reader.pages)} pages) ✓"
+        )
+        return chunks
+
+
+    # ───────────────────────────────────────────────────
+    # NEW METHOD 9 — ingest_pdf() ← MAIN UPLOAD METHOD
+    # Called by upload.py when frontend uploads a PDF
+    # Does everything in one call:
+    # 1. Saves PDF to disk
+    # 2. Extracts text chunks
+    # 3. Stores all chunks in ChromaDB
+    # Returns stats dict for frontend to display
+    # ───────────────────────────────────────────────────
+    def ingest_pdf(self, pdf_bytes: bytes, filename: str) -> dict:
+        logger.info(f"[Vault] Starting PDF ingestion: {filename}")
+
+        # STEP 1 — Save PDF file physically to disk
+        saved_path = self.save_pdf_file(pdf_bytes, filename)
+
+        # STEP 2 — Extract text chunks from PDF
+        chunks = self.extract_chunks_from_pdf(pdf_bytes, filename)
+
+        # If no text found → return failure
+        if not chunks:
+            logger.warning(f"[Vault] No text extracted from {filename}")
+            return {
+                "success": False,
+                "filename": filename,
+                "chunks_added": 0,
+                "total_vault_size": self.get_count(),
+                "message": f"Could not extract text from {filename}"
+            }
+
+        # STEP 3 — Store all chunks in ChromaDB vault
+        self.add_documents_bulk(
+            texts=chunks,
+            source_name=filename
+        )
+
+        logger.info(
+            f"[Vault] Ingestion complete! "
+            f"{len(chunks)} chunks stored from {filename} ✓"
+        )
+
+        # Return success stats to frontend
+        return {
+            "success": True,
+            "filename": filename,
+            "saved_path": saved_path,
+            "chunks_added": len(chunks),
+            "total_vault_size": self.get_count(),
+            "message": f"Successfully loaded {len(chunks)} facts from {filename}"
+        }
+
+
+    # ───────────────────────────────────────────────────
+    # NEW METHOD 10 — list_uploaded_pdfs()
+    # Returns list of all PDFs saved in uploaded_docs/
+    # Frontend uses this for "Loaded Documents" panel
+    # ───────────────────────────────────────────────────
+    def list_uploaded_pdfs(self) -> list[dict]:
+        pdfs = []
+
+        if not os.path.exists(UPLOAD_DIR):
+            return pdfs
+
+        for filename in os.listdir(UPLOAD_DIR):
+            if filename.endswith(".pdf"):
+                filepath = os.path.join(UPLOAD_DIR, filename)
+                size_kb  = os.path.getsize(filepath) / 1024
+                pdfs.append({
+                    "filename": filename,
+                    "size_kb": round(size_kb, 2),
+                    "path": filepath
+                })
+
+        logger.info(f"[Vault] {len(pdfs)} PDFs found in upload folder")
+        return pdfs
+
+
 # ═══════════════════════════════════════════════════════
 # FUNCTION: load_demo_financial_data()
 # Seeds the vault with 10 real financial facts
@@ -214,7 +345,6 @@ class GroundTruthVault:
 def load_demo_financial_data(vault: GroundTruthVault):
     logger.info("[Vault] Loading demo financial facts...")
 
-    # Each tuple = (fact text, source PDF name)
     facts = [
         (
             "Apple Inc reported total revenue of $394.3 billion "
@@ -268,7 +398,6 @@ def load_demo_financial_data(vault: GroundTruthVault):
         ),
     ]
 
-    # Add all facts to vault
     for text, source in facts:
         vault.add_document(text=text, source_name=source)
 
