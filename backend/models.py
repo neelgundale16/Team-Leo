@@ -127,25 +127,25 @@ class SSEEvent(BaseModel):
         "error"         # something went wrong
     ]
     data: dict          # the actual payload (flexible)
-```
+# ```
 
----
+# ---
 
-### 🔍 Key Things to Understand
+# ### 🔍 Key Things to Understand
 
-**Why `Literal[...]`?**
-It means only those exact values are allowed. If sentinel.py accidentally sends `label="wrong"` instead of `"entailment"`, Pydantic throws an error immediately. Catches bugs early.
+# **Why `Literal[...]`?**
+# It means only those exact values are allowed. If sentinel.py accidentally sends `label="wrong"` instead of `"entailment"`, Pydantic throws an error immediately. Catches bugs early.
 
-**Why `Optional[X] = None`?**
-Some fields only exist sometimes. `vault_result` is `None` if the vault found nothing. `corrected_sentence` is `None` if no correction was needed.
+# **Why `Optional[X] = None`?**
+# Some fields only exist sometimes. `vault_result` is `None` if the vault found nothing. `corrected_sentence` is `None` if no correction was needed.
 
-**Why `Field(default_factory=...)`?**
-For `timestamp` — you can't write `default=datetime.now().timestamp()` because that runs once at import time. `default_factory` runs it fresh every time a new token is created.
+# **Why `Field(default_factory=...)`?**
+# For `timestamp` — you can't write `default=datetime.now().timestamp()` because that runs once at import time. `default_factory` runs it fresh every time a new token is created.
 
----
+# ---
 
-### ✅ Self-Check Before Task 2
-```
-□ File saved at backend/models.py
-□ 8 classes exist in the file
-□ No syntax errors (run: python models.py — should print nothing)
+# ### ✅ Self-Check Before Task 2
+# ```
+# □ File saved at backend/models.py
+# □ 8 classes exist in the file
+# □ No syntax errors (run: python models.py — should print nothing)
