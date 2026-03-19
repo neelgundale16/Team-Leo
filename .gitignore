@@ -1,0 +1,6 @@
+backend/.venv/
+backend/vault_db/
+backend/__pycache__/
+backend/.env
+frontend/veracity-ui/node_modules/
+frontend/veracity-ui/.next/
