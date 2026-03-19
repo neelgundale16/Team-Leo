@@ -1,21 +1,21 @@
 """
 interceptor.py — Streaming Interceptor with Entropy-Based Claim Detection
 
-Detection strategy: Shannon entropy computed from per-token log probabilities
-returned by the Groq API. High-entropy tokens signal epistemic uncertainty in
-the model — these are the positions where hallucinations occur.
+Groq returns per-token logprob (log probability of the chosen token).
+We compute single-token Shannon entropy from that single value:
 
-Entropy per token:
-    H(t) = -sum( p_i * log(p_i) ) over top-k candidate tokens at position t
+    p     = exp(logprob)          # probability of chosen token
+    H(t)  = -p * log(p)           # entropy contribution
 
-A claim boundary is detected when a token's entropy exceeds ENTROPY_THRESHOLD,
-meaning the model was uncertain which token to generate — a strong signal that
-the surrounding span is a factual claim being "guessed" rather than recalled.
+High H(t) means the model assigned low probability to its own chosen token —
+a direct signal of epistemic uncertainty at that position.
 
-This replaces hardcoded regex patterns with a fully LLM-driven signal.
-Reference: Semantic Entropy (Kuhn et al.), Kernel Language Entropy (ICLR 2024)
+This is equivalent to the self-information (surprisal) of the token,
+grounded in information theory and the REVERSE algorithm's uncertainty signal.
+No top_logprobs needed — works on all Groq models and tiers.
 """
 
+import re
 import json
 import math
 import httpx
@@ -29,90 +29,65 @@ from models import Claim
 logger = logging.getLogger(__name__)
 
 # ── Groq Config ────────────────────────────────────────────────────────────────
-GROQ_API_URL  = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL    = "llama3-8b-8192"
-GROQ_TOP_LOGPROBS = 5          # number of candidate tokens per position
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL   = "llama3-8b-8192"
 
 # ── Entropy Thresholds ─────────────────────────────────────────────────────────
-# Tokens with H > ENTROPY_THRESHOLD are considered uncertain (claim candidates)
-# Derived from REVERSE algorithm: tau_generative = 0.003 mapped to entropy scale
-ENTROPY_THRESHOLD   = 1.2      # nats — tunable, lower = more sensitive
-WINDOW_SIZE         = 6        # sliding window to smooth entropy signal
-BURST_MIN_TOKENS    = 2        # minimum consecutive high-entropy tokens = claim span
+# H(t) = -p*log(p) peaks at p=0.368 with H≈0.368
+# Tokens the model was uncertain about have H > threshold
+ENTROPY_THRESHOLD = 0.25       # tuned for single-token surprisal scale
+WINDOW_SIZE       = 6          # smoothing window
+BURST_MIN_TOKENS  = 2          # min consecutive high-entropy tokens = claim span
 
-# ── Sentence Boundary ──────────────────────────────────────────────────────────
-import re
+# ── Sentence boundary ──────────────────────────────────────────────────────────
 SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
 
 
-# ── Entropy Calculator ─────────────────────────────────────────────────────────
-def compute_token_entropy(top_logprobs: list[dict]) -> float:
+# ── Entropy from single logprob ────────────────────────────────────────────────
+def compute_token_entropy(logprob: float) -> float:
     """
-    Compute Shannon entropy from top-k log probability distribution
-    returned by the Groq API for a single token position.
+    Compute single-token entropy from the token's own log probability.
 
-    H = -sum( p_i * log(p_i) )
+    H(t) = -p * log(p)   where p = exp(logprob)
 
-    Args:
-        top_logprobs: list of {"token": str, "logprob": float} dicts
-                      from Groq API response
-
-    Returns:
-        entropy in nats (float). Higher = model was more uncertain.
+    Range: 0 (certain) → ~0.368 (maximally uncertain at p=1/e)
+    Tokens with low p (model was surprised by its own output) → high H
     """
-    if not top_logprobs:
+    if logprob is None:
         return 0.0
-
-    # Convert log probs to probabilities
-    log_probs = [entry["logprob"] for entry in top_logprobs]
-
-    # Numerical stability: subtract max before exp
-    max_lp    = max(log_probs)
-    probs_raw = [math.exp(lp - max_lp) for lp in log_probs]
-    total     = sum(probs_raw)
-    probs     = [p / total for p in probs_raw]
-
-    # Shannon entropy
-    entropy = -sum(p * math.log(p + 1e-12) for p in probs if p > 0)
-    return round(entropy, 6)
+    p = math.exp(max(logprob, -20.0))   # clamp to avoid underflow
+    if p <= 0:
+        return 0.0
+    return round(-p * math.log(p + 1e-12), 6)
 
 
 def smooth_entropy(window: deque) -> float:
-    """Return mean entropy over the sliding window."""
     if not window:
         return 0.0
     return sum(window) / len(window)
 
 
+# ── Claim detection from entropy signal ───────────────────────────────────────
 def detect_claim_from_span(
-    span_tokens: list[str],
-    span_entropies: list[float],
-    sentence: str,
-    position: int
+    span_tokens:    list,
+    span_entropies: list,
+    sentence:       str,
+    position:       int
 ) -> Claim | None:
-    """
-    Given a high-entropy token span, build a Claim object.
-    The claim text is the span itself.
-    Type is inferred from the span content — not from hardcoded regex
-    but from the LLM's own uncertainty pattern.
-    """
     claim_text = "".join(span_tokens).strip()
     if not claim_text:
         return None
 
     avg_entropy = sum(span_entropies) / len(span_entropies)
 
-    # Infer claim type from average entropy magnitude
-    # High entropy = numerical/statistical claim (model is guessing a number)
-    # Medium entropy = named entity or temporal claim
-    # Lower (but above threshold) = general factual claim
-    if avg_entropy > 2.5:
+    # Claim type inferred from entropy magnitude — no hardcoding
+    if avg_entropy > 0.32:
         claim_type = "statistic"
-    elif avg_entropy > 1.8:
+    elif avg_entropy > 0.29:
         claim_type = "number"
-    elif avg_entropy > 1.5:
+    elif avg_entropy > 0.27:
         claim_type = "name"
-    elif avg_entropy > 1.3:
+    elif avg_entropy > 0.25:
         claim_type = "date"
     else:
         claim_type = "general"
@@ -126,31 +101,24 @@ def detect_claim_from_span(
 
 
 def extract_claims_from_entropy(
-    tokens:    list[str],
-    entropies: list[float],
+    tokens:    list,
+    entropies: list,
     sentence:  str
-) -> list[Claim]:
-    """
-    Scan token-level entropy values across a completed sentence.
-    Identify contiguous spans of high-entropy tokens as claim boundaries.
-
-    This is the entropy-based replacement for regex pattern matching.
-    The model's own uncertainty signal drives detection — no hardcoding.
-    """
+) -> list:
     if not tokens or not entropies:
         return []
 
-    claims      = []
-    in_span     = False
-    span_tokens : list[str]   = []
-    span_entropies: list[float] = []
-    span_start  = 0
+    claims         = []
+    in_span        = False
+    span_tokens    = []
+    span_entropies = []
+    span_start     = 0
 
     for i, (token, entropy) in enumerate(zip(tokens, entropies)):
         if entropy > ENTROPY_THRESHOLD:
             if not in_span:
-                in_span    = True
-                span_start = i
+                in_span        = True
+                span_start     = i
                 span_tokens    = [token]
                 span_entropies = [entropy]
             else:
@@ -158,7 +126,6 @@ def extract_claims_from_entropy(
                 span_entropies.append(entropy)
         else:
             if in_span and len(span_tokens) >= BURST_MIN_TOKENS:
-                # Span ended — create claim
                 claim = detect_claim_from_span(
                     span_tokens, span_entropies, sentence, span_start
                 )
@@ -168,7 +135,6 @@ def extract_claims_from_entropy(
             span_tokens    = []
             span_entropies = []
 
-    # Flush any open span at sentence end
     if in_span and len(span_tokens) >= BURST_MIN_TOKENS:
         claim = detect_claim_from_span(
             span_tokens, span_entropies, sentence, span_start
@@ -179,22 +145,15 @@ def extract_claims_from_entropy(
     return claims
 
 
-# ── Groq Stream with Logprobs ──────────────────────────────────────────────────
-async def _stream_groq(query: str) -> AsyncGenerator[tuple[str, float], None]:
+# ── Groq Stream ────────────────────────────────────────────────────────────────
+async def _stream_groq(query: str) -> AsyncGenerator[tuple, None]:
     """
-    Stream tokens from Groq API with per-token log probabilities.
+    Stream from Groq with per-token logprobs.
+    Uses logprobs=true (supported on all Groq tiers).
+    Does NOT use top_logprobs (not universally supported).
     Yields (token_text, entropy) tuples.
-
-    Groq logprobs spec (OpenAI-compatible):
-      response.choices[0].delta.content          → token text
-      response.choices[0].logprobs.content[0]    → logprob entry
-        .logprob                                  → log P of chosen token
-        .top_logprobs                             → list of top-k alternatives
-
-    Get your free API key: https://console.groq.com
-    Add to backend/.env: GROQ_API_KEY=gsk_...
     """
-    api_key = os.getenv("GROQ_API_KEY", "")
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
         raise ValueError(
             "GROQ_API_KEY not set. "
@@ -205,9 +164,8 @@ async def _stream_groq(query: str) -> AsyncGenerator[tuple[str, float], None]:
         "Authorization": f"Bearer {api_key}",
         "Content-Type":  "application/json",
     }
-
     payload = {
-        "model": GROQ_MODEL,
+        "model":       GROQ_MODEL,
         "messages": [
             {
                 "role":    "system",
@@ -215,16 +173,15 @@ async def _stream_groq(query: str) -> AsyncGenerator[tuple[str, float], None]:
                     "You are a financial analysis assistant. "
                     "Answer questions about company financials, market data, "
                     "and economic indicators using specific numbers, "
-                    "percentages, and statistics."
+                    "percentages, dates, and statistics."
                 )
             },
             {"role": "user", "content": query}
         ],
-        "stream":     True,
+        "stream":      True,
         "temperature": 0.7,
         "max_tokens":  500,
-        "logprobs":    True,
-        "top_logprobs": GROQ_TOP_LOGPROBS,
+        "logprobs":    True,    # single logprob per token — works on all tiers
     }
 
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -233,7 +190,13 @@ async def _stream_groq(query: str) -> AsyncGenerator[tuple[str, float], None]:
             headers=headers,
             json=payload
         ) as response:
-            response.raise_for_status()
+            if response.status_code != 200:
+                body = await response.aread()
+                raise httpx.HTTPStatusError(
+                    f"Groq returned {response.status_code}: {body.decode()[:200]}",
+                    request=response.request,
+                    response=response
+                )
 
             async for line in response.aiter_lines():
                 if not line.startswith("data: "):
@@ -241,7 +204,6 @@ async def _stream_groq(query: str) -> AsyncGenerator[tuple[str, float], None]:
                 data = line[6:].strip()
                 if data == "[DONE]":
                     break
-
                 try:
                     chunk   = json.loads(data)
                     choice  = chunk["choices"][0]
@@ -249,19 +211,14 @@ async def _stream_groq(query: str) -> AsyncGenerator[tuple[str, float], None]:
                     if not content:
                         continue
 
-                    # Extract entropy from logprobs if available
-                    entropy = 0.0
-                    logprobs_data = choice.get("logprobs")
-                    if logprobs_data and logprobs_data.get("content"):
-                        lp_entry    = logprobs_data["content"][0]
-                        top_lp_list = lp_entry.get("top_logprobs", [])
-                        if top_lp_list:
-                            entropy = compute_token_entropy(top_lp_list)
-                        else:
-                            # Fallback: single token entropy from its own logprob
-                            lp      = lp_entry.get("logprob", 0.0)
-                            p       = math.exp(lp)
-                            entropy = -(p * math.log(p + 1e-12))
+                    # Extract single logprob entropy
+                    entropy      = 0.0
+                    logprobs_obj = choice.get("logprobs")
+                    if logprobs_obj and logprobs_obj.get("content"):
+                        lp_entry = logprobs_obj["content"][0]
+                        lp_val   = lp_entry.get("logprob")
+                        if lp_val is not None:
+                            entropy = compute_token_entropy(lp_val)
 
                     yield (content, entropy)
 
@@ -269,93 +226,71 @@ async def _stream_groq(query: str) -> AsyncGenerator[tuple[str, float], None]:
                     continue
 
 
-# ── Mock Stream with Synthetic Entropy ────────────────────────────────────────
-async def _stream_mock(query: str) -> AsyncGenerator[tuple[str, float], None]:
+# ── Mock Stream ────────────────────────────────────────────────────────────────
+async def _stream_mock(query: str) -> AsyncGenerator[tuple, None]:
     """
-    Mock stream for testing without a Groq API key.
-    Assigns synthetic entropy values — high entropy on hallucinated values
-    so the correction pipeline triggers correctly in demo mode.
-    Enable: USE_MOCK=true in backend/.env
+    Mock stream with synthetic entropy for offline testing.
+    Hallucinated values carry high entropy — demo pipeline triggers correctly.
+    Set USE_MOCK=true in backend/.env
     """
-    # (token, entropy) — high entropy assigned to hallucinated numbers
-    mock_tokens: list[tuple[str, float]] = [
-        ("Apple", 0.4), (" Inc", 0.3), (" reported", 0.5),
-        (" revenue", 0.6), (" of", 0.4),
-        (" $", 1.4), ("523", 2.8), (" billion", 2.6),   # HIGH — hallucination
-        (" in", 0.3), (" fiscal", 0.5), (" year", 0.4), (" 2022", 0.9),
-        (".", 0.1), (" ",  0.1),
-        ("Microsoft", 0.4), (" Azure", 0.5), (" cloud", 0.4),
-        (" revenue", 0.5), (" grew", 0.6),
-        (" 45", 2.9), ("%", 2.7),                        # HIGH — hallucination
-        (" year", 0.4), ("-over-", 0.3), ("year", 0.3),
-        (" in", 0.3), (" Q4", 0.7), (" 2023", 0.8),
-        (".", 0.1), (" ", 0.1),
-        ("Tesla", 0.4), (" delivered", 0.5),
-        (" 2.1", 2.8), (" million", 2.5),                # HIGH — hallucination
-        (" vehicles", 0.4), (" in", 0.3), (" 2023", 0.6),
-        (".", 0.1), (" ", 0.1),
-        ("The", 0.3), (" Federal", 0.4), (" Reserve", 0.4),
-        (" held", 0.5), (" interest", 0.4), (" rates", 0.5), (" at",  0.4),
-        (" 4", 2.7), (".", 2.5), ("75", 2.8), ("%", 2.6), # HIGH — hallucination
-        (" in", 0.3), (" December", 0.5), (" 2023", 0.6),
-        (".", 0.1),
+    mock_tokens = [
+        ("Apple", 0.05), (" Inc", 0.04), (" reported", 0.08),
+        (" revenue", 0.09), (" of", 0.06),
+        (" $", 0.22), ("523", 0.34), (" billion", 0.31),  # HIGH — hallucination
+        (" in", 0.05), (" fiscal", 0.07), (" year", 0.06), (" 2022", 0.12),
+        (".", 0.02), (" ", 0.01),
+        ("Microsoft", 0.06), (" Azure", 0.07), (" revenue", 0.08),
+        (" grew", 0.09),
+        (" 45", 0.35), ("%", 0.33),                        # HIGH — hallucination
+        (" year", 0.06), ("-over-", 0.05), ("year", 0.05),
+        (" in", 0.05), (" Q4", 0.10), (" 2023", 0.11),
+        (".", 0.02), (" ", 0.01),
+        ("Tesla", 0.06), (" delivered", 0.08),
+        (" 2.1", 0.34), (" million", 0.31),                # HIGH — hallucination
+        (" vehicles", 0.07), (" in", 0.05), (" 2023", 0.09),
+        (".", 0.02), (" ", 0.01),
+        ("The", 0.04), (" Federal", 0.06), (" Reserve", 0.06),
+        (" held", 0.08), (" interest", 0.07), (" rates", 0.08),
+        (" at", 0.06),
+        (" 4", 0.33), (".", 0.30), ("75", 0.34), ("%", 0.32),  # HIGH — hallucination
+        (" in", 0.05), (" December", 0.08), (" 2023", 0.10),
+        (".", 0.02),
     ]
-
     for token, entropy in mock_tokens:
         yield (token, entropy)
         await asyncio.sleep(0.04)
 
 
-# ── Core Interceptor Generator ─────────────────────────────────────────────────
+# ── Core Generator ─────────────────────────────────────────────────────────────
 async def stream_and_detect(
     query: str
-) -> AsyncGenerator[tuple[str, list[Claim]], None]:
+) -> AsyncGenerator[tuple, None]:
     """
-    Main interceptor generator — called by main.py firewall pipeline.
-
-    Per token:
-      1. Record (token, entropy) pair
-      2. Yield raw token immediately for live frontend streaming
-      3. Buffer into sentences
-      4. On sentence boundary: run entropy-based claim detection
-         across all token entropies in that sentence
-      5. Yield (sentence, [Claim, ...])
+    Main interceptor generator called by main.py.
 
     Yields:
-      ("TOKEN:<text>", [])         raw token — stream to UI immediately
+      ("TOKEN:<text>", [])         raw token — yield to frontend immediately
       ("<sentence>",  [Claim, …])  completed sentence + entropy-detected claims
       ("ERROR:<msg>", [])          on failure
     """
-    use_mock = os.getenv("USE_MOCK", "false").lower() == "true"
-
-    text_buffer    : str        = ""
-    token_buffer   : list[str]  = []
-    entropy_buffer : list[float]= []
-    entropy_window : deque      = deque(maxlen=WINDOW_SIZE)
-    token_count    : int        = 0
-
-    stream_fn = _stream_mock if use_mock else _stream_groq
+    use_mock       = os.getenv("USE_MOCK", "false").lower() == "true"
+    text_buffer    = ""
+    token_buffer   = []
+    entropy_buffer = []
+    entropy_window = deque(maxlen=WINDOW_SIZE)
+    token_count    = 0
+    stream_fn      = _stream_mock if use_mock else _stream_groq
 
     try:
         async for token, entropy in stream_fn(query):
-            token_count += 1
-
-            # Track entropy signal
-            entropy_window.append(entropy)
+            token_count    += 1
             text_buffer    += token
             token_buffer   .append(token)
             entropy_buffer .append(entropy)
+            entropy_window .append(entropy)
 
-            # Yield raw token immediately — do not block on verification
+            # Yield raw token immediately
             yield (f"TOKEN:{token}", [])
-
-            # Log smoothed entropy for observability
-            smoothed = smooth_entropy(entropy_window)
-            if smoothed > ENTROPY_THRESHOLD:
-                logger.debug(
-                    f"High entropy window: {smoothed:.3f} "
-                    f"at token '{token.strip()}'"
-                )
 
             # Check for completed sentences
             parts = SENTENCE_END.split(text_buffer)
@@ -366,53 +301,41 @@ async def stream_and_detect(
                         continue
 
                     # Align token/entropy buffers to this sentence
-                    sentence_len   = len(sentence)
-                    char_count     = 0
-                    sentence_tokens   : list[str]   = []
-                    sentence_entropies: list[float] = []
-
+                    char_count        = 0
+                    sentence_tokens   = []
+                    sentence_entropies= []
                     for tok, ent in zip(token_buffer, entropy_buffer):
-                        if char_count >= sentence_len:
+                        if char_count >= len(sentence):
                             break
                         sentence_tokens.append(tok)
                         sentence_entropies.append(ent)
                         char_count += len(tok)
 
-                    # Entropy-based claim detection
                     claims = extract_claims_from_entropy(
-                        sentence_tokens,
-                        sentence_entropies,
-                        sentence
+                        sentence_tokens, sentence_entropies, sentence
                     )
-
                     logger.debug(
                         f"Sentence: '{sentence[:60]}' | "
-                        f"Entropy claims: {len(claims)} | "
-                        f"Peak entropy: {max(sentence_entropies, default=0):.3f}"
+                        f"Claims: {len(claims)} | "
+                        f"Peak H: {max(sentence_entropies, default=0):.3f}"
                     )
-
                     yield (sentence, claims)
 
-                # Keep trailing incomplete fragment
+                # Trim buffers to remaining text
                 text_buffer    = parts[-1]
-                # Trim buffers to match remaining text
                 remaining_len  = len(text_buffer)
                 char_count     = 0
-                new_tok_buf : list[str]   = []
-                new_ent_buf : list[float] = []
-                for tok, ent in zip(
-                    reversed(token_buffer),
-                    reversed(entropy_buffer)
-                ):
+                new_toks, new_ents = [], []
+                for tok, ent in zip(reversed(token_buffer), reversed(entropy_buffer)):
                     if char_count >= remaining_len:
                         break
-                    new_tok_buf.insert(0, tok)
-                    new_ent_buf.insert(0, ent)
+                    new_toks.insert(0, tok)
+                    new_ents.insert(0, ent)
                     char_count += len(tok)
-                token_buffer   = new_tok_buf
-                entropy_buffer = new_ent_buf
+                token_buffer   = new_toks
+                entropy_buffer = new_ents
 
-        # Flush remaining buffer
+        # Flush remainder
         if text_buffer.strip():
             claims = extract_claims_from_entropy(
                 token_buffer, entropy_buffer, text_buffer.strip()
@@ -424,18 +347,15 @@ async def stream_and_detect(
         yield (f"ERROR:{str(e)}", [])
 
     except httpx.HTTPStatusError as e:
-        logger.error(f"Groq API error {e.response.status_code}")
-        yield (f"ERROR:Groq API returned {e.response.status_code}", [])
+        logger.error(f"Groq API error: {e}")
+        yield (f"ERROR:{str(e)}", [])
 
     except httpx.ConnectError:
         logger.error("Cannot reach Groq API")
-        yield ("ERROR:Cannot reach Groq API. Check internet connection.", [])
+        yield ("ERROR:Cannot reach Groq API. Check internet.", [])
 
     except Exception as e:
         logger.error(f"Interceptor error: {e}", exc_info=True)
         yield (f"ERROR:{str(e)}", [])
 
-    logger.info(
-        f"Stream complete | tokens: {token_count} | "
-        f"entropy threshold: {ENTROPY_THRESHOLD}"
-    )
+    logger.info(f"Stream done | tokens: {token_count}")
