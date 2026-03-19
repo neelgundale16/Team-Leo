@@ -9,7 +9,6 @@ from models import VaultResult
 from typing import Optional
 import os
 import io
-import io
 from pypdf import PdfReader
 import logging
 

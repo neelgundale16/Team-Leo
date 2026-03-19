@@ -26,22 +26,37 @@ export default function Home() {
           form.append('file', file);
           form.append('source_name', file.name);
 
-          const uploadRes = await fetch('/api/vault/upload', {
-            method: 'POST',
-            body: form,
-            // Do NOT set Content-Type — browser sets it with boundary automatically
-          });
+          let uploadRes: Response;
+          try {
+            uploadRes = await fetch('/api/vault/upload', {
+              method: 'POST',
+              body: form,
+              // Do NOT set Content-Type — browser sets it with boundary automatically
+            });
+          } catch {
+            throw new Error(
+              `Cannot connect to the backend server. Make sure it is running on port 8000.\n` +
+              `Run: uvicorn main:app --reload --port 8000`
+            );
+          }
 
           if (!uploadRes.ok) {
-            const errBody = await uploadRes.text();
-            throw new Error(`Upload failed for "${file.name}": ${errBody}`);
+            let errDetail = `HTTP ${uploadRes.status}`;
+            try {
+              const errBody = await uploadRes.json();
+              errDetail = errBody.detail ?? errBody.message ?? JSON.stringify(errBody);
+            } catch {
+              errDetail = await uploadRes.text().catch(() => `HTTP ${uploadRes.status}`);
+            }
+            throw new Error(`Upload failed for "${file.name}": ${errDetail}`);
           }
 
           const uploadData = await uploadRes.json();
           console.log(
-            `Vault upload: ${uploadData.filename} — ` +
+            `✅ Vault upload: ${uploadData.filename} — ` +
             `${uploadData.chunks_added} chunks added. ` +
-            `Vault total: ${uploadData.vault_total}`
+            `Vault total: ${uploadData.vault_total}. ` +
+            `${uploadData.message ?? ''}`
           );
         }
       }
@@ -51,17 +66,31 @@ export default function Home() {
       const finalQuery = query.trim() ||
         `Summarize the key financial facts from the uploaded document.`;
 
-      const response = await fetch('/api/chat', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ query: finalQuery }),
-      });
+      let response: Response;
+      try {
+        response = await fetch('/api/chat', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ query: finalQuery }),
+        });
+      } catch {
+        throw new Error(
+          `Cannot connect to the backend server. Make sure it is running on port 8000.\n` +
+          `Run: uvicorn main:app --reload --port 8000`
+        );
+      }
 
       if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Backend error ${response.status}: ${errText}`);
+        let errDetail = `HTTP ${response.status}`;
+        try {
+          const errBody = await response.json();
+          errDetail = errBody.detail ?? errBody.message ?? JSON.stringify(errBody);
+        } catch {
+          errDetail = await response.text().catch(() => `HTTP ${response.status}`);
+        }
+        throw new Error(`Backend error: ${errDetail}`);
       }
-      if (!response.body) throw new Error('No response body received');
+      if (!response.body) throw new Error('No response body received from server.');
 
       // ── Step 3: Read SSE stream ───────────────────────────────────────────
       const reader  = response.body.getReader();
@@ -160,7 +189,7 @@ export default function Home() {
       }
 
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Connection failed');
+      setError(err instanceof Error ? err.message : 'Connection failed. Is the backend running?');
     } finally {
       setIsStreaming(false);
     }

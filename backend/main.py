@@ -182,13 +182,29 @@ async def vault_upload(
     """Upload PDF or text file to the Ground Truth Vault."""
     filename     = source_name or file.filename or "uploaded_document"
     content_type = file.content_type or ""
-    raw_bytes    = await file.read()
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file was received. Please attach a file before uploading.")
+
+    raw_bytes = await file.read()
+
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail=f"File '{filename}' appears to be empty. Please upload a file with content.")
+
     chunks: list = []
 
     if "pdf" in content_type or filename.lower().endswith(".pdf"):
         try:
             import pypdf, io as _io
+        except ImportError:
+            raise HTTPException(
+                status_code=500,
+                detail="pypdf is not installed on the server. Run: pip install pypdf"
+            )
+        try:
             reader = pypdf.PdfReader(_io.BytesIO(raw_bytes))
+            if len(reader.pages) == 0:
+                raise HTTPException(status_code=400, detail=f"'{filename}' has no pages.")
             for page in reader.pages:
                 text = page.extract_text()
                 if text and text.strip():
@@ -201,10 +217,13 @@ async def vault_upload(
                             chunk, chars = [], 0
                     if chunk:
                         chunks.append(" ".join(chunk))
-        except ImportError:
-            raise HTTPException(500, "Run: pip install pypdf")
+        except HTTPException:
+            raise
         except Exception as e:
-            raise HTTPException(400, f"PDF parse error: {e}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not read '{filename}'. It may be encrypted, corrupted, or a scanned image-only PDF. Error: {e}"
+            )
     else:
         try:
             text = raw_bytes.decode("utf-8")
@@ -218,16 +237,25 @@ async def vault_upload(
             if chunk:
                 chunks.append(" ".join(chunk))
         except UnicodeDecodeError:
-            raise HTTPException(400, "File must be PDF or UTF-8 text")
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{filename}' could not be decoded. File must be a PDF or a plain UTF-8 text file."
+            )
 
     if not chunks:
-        raise HTTPException(400, "No text extracted from file")
+        raise HTTPException(
+            status_code=400,
+            detail=f"No text could be extracted from '{filename}'. It may be a scanned image PDF with no selectable text."
+        )
 
     vault.add_documents_bulk(chunks, filename)
     logger.info(f"Uploaded '{filename}' | {len(chunks)} chunks → vault")
     return JSONResponse({
-        "status": "success", "filename": filename,
-        "chunks_added": len(chunks), "vault_total": vault.get_count()
+        "status":       "success",
+        "filename":     filename,
+        "chunks_added": len(chunks),
+        "vault_total":  vault.get_count(),
+        "message":      f"Successfully loaded {len(chunks)} facts from '{filename}' into the vault."
     })
 
 
