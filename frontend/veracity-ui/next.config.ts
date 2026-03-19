@@ -1,17 +1,17 @@
 import type { NextConfig } from 'next'
 
 const nextConfig: NextConfig = {
-  // Allow the frontend to call the FastAPI backend on localhost:8000
+  // Proxy /api/* → backend so there is zero CORS issue
   async rewrites() {
     return [
       {
-        source: '/api/:path*',
-        destination: 'http://localhost:8000/:path*',
+        source:      '/api/:path*',
+        destination: 'http://127.0.0.1:8000/:path*',
       },
     ]
   },
 
-  // Disable strict mode in dev to prevent double SSE connections
+  // Disable strict mode — prevents double SSE connections in dev
   reactStrictMode: false,
 }
 
