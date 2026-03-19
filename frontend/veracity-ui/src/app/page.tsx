@@ -1,65 +1,170 @@
-import Image from "next/image";
+'use client';
+
+import { useState, useCallback } from 'react';
+import QueryInput, { AttachedFile } from '@/components/QueryInput';
+import TokenStream from '@/components/TokenStream';
+import StatsPanel from '@/components/StatsPanel';
+import { Token, SessionStats } from '@/types';
 
 export default function Home() {
+  const [tokens, setTokens]          = useState<Token[]>([]);
+  const [stats, setStats]            = useState<SessionStats | null>(null);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [error, setError]            = useState<string | null>(null);
+
+  const handleSubmit = useCallback(
+    async (query: string, attachments: AttachedFile[]) => {
+      // Reset state
+      setTokens([]);
+      setStats(null);
+      setError(null);
+      setIsStreaming(true);
+
+      try {
+        let response: Response;
+
+        if (attachments.length > 0) {
+          // ── Send as multipart/form-data so files reach the backend ──
+          const form = new FormData();
+          form.append('query', query);
+          attachments.forEach(({ file }) => form.append('files', file));
+
+          response = await fetch('http://localhost:8000/chat', {
+            method: 'POST',
+            // Do NOT set Content-Type — browser sets boundary automatically
+            body: form,
+          });
+        } else {
+          // ── Plain JSON (original behaviour) ──
+          response = await fetch('http://localhost:8000/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query }),
+          });
+        }
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        if (!response.body) {
+          throw new Error('No response body received');
+        }
+
+        const reader  = response.body.getReader();
+        const decoder = new TextDecoder();
+        let   buffer  = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+
+          // SSE events are separated by "\n\n"
+          const parts = buffer.split('\n\n');
+          buffer = parts.pop() ?? '';
+
+          for (const part of parts) {
+            const lines = part.split('\n');
+            for (const line of lines) {
+              if (!line.startsWith('data: ')) continue;
+              const jsonStr = line.slice(6).trim();
+              if (!jsonStr || jsonStr === '[DONE]') continue;
+
+              try {
+                const event = JSON.parse(jsonStr);
+                const { event_type, data } = event;
+
+                if (event_type === 'token') {
+                  const newToken: Token = {
+                    id:        data.id,
+                    text:      data.text,
+                    status:    data.status ?? 'streaming',
+                    timestamp: Date.now(),
+                  };
+                  setTokens((prev) => [...prev, newToken]);
+
+                } else if (event_type === 'correction') {
+                  setTokens((prev) =>
+                    prev.map((t) =>
+                      t.id === data.id
+                        ? {
+                            ...t,
+                            status:     'corrected',
+                            correction: data.corrected,
+                            source:     data.source,
+                          }
+                        : t
+                    )
+                  );
+
+                } else if (event_type === 'stats') {
+                  setStats(data as SessionStats);
+
+                } else if (event_type === 'done') {
+                  if (data?.session_stats) {
+                    setStats(data.session_stats as SessionStats);
+                  }
+                  setIsStreaming(false);
+
+                } else if (event_type === 'error') {
+                  setError(data?.message ?? 'Unknown error from server');
+                  setIsStreaming(false);
+                }
+              } catch {
+                // Malformed JSON line — skip
+              }
+            }
+          }
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Connection failed';
+        setError(msg);
+      } finally {
+        setIsStreaming(false);
+      }
+    },
+    []
+  );
+
+  const correctionCount = tokens.filter((t) => t.status === 'corrected').length;
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
+    <div className="app-root">
+      {/* ── Header ───────────────────────────────────────── */}
+      <header className="app-header">
+        <span className="header-title">🛡️ Project Veracity</span>
+        <span className="header-badge">FIREWALL ACTIVE</span>
+        <span className="header-subtitle">
+          XEN-O-THON 2026 &nbsp;·&nbsp; Team Leo &nbsp;·&nbsp; GTBIT New Delhi
+        </span>
+      </header>
+
+      {/* ── Main ─────────────────────────────────────────── */}
+      <main className="app-main">
+        <section className="main-left">
+          <QueryInput onSubmit={handleSubmit} isLoading={isStreaming} />
+
+          {error && (
+            <div className="error-banner">
+              ⚠ ERROR &nbsp;—&nbsp; {error}
+            </div>
+          )}
+
+          <TokenStream tokens={tokens} isStreaming={isStreaming} />
+        </section>
+
+        <StatsPanel
+          stats={stats}
+          isVisible={isStreaming || stats !== null || correctionCount > 0}
         />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
       </main>
+
+      {/* ── Footer ───────────────────────────────────────── */}
+      <footer className="app-footer">
+        <span>XEN-O-THON 2026 &nbsp;|&nbsp; Team Leo</span>
+        <span>AI &amp; Automation — Beyond Wrappers</span>
+      </footer>
     </div>
   );
 }
