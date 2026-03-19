@@ -19,24 +19,51 @@ export default function Home() {
     setIsStreaming(true);
 
     try {
-      let response: Response;
-
+      // ── Step 1: Upload any attached files to the vault first ──────────────
       if (attachments.length > 0) {
-        const form = new FormData();
-        form.append('query', query);
-        attachments.forEach(({ file }) => form.append('files', file));
-        response = await fetch('http://localhost:8000/chat', { method: 'POST', body: form });
-      } else {
-        response = await fetch('http://localhost:8000/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query }),
-        });
+        for (const { file } of attachments) {
+          const form = new FormData();
+          form.append('file', file);
+          form.append('source_name', file.name);
+
+          const uploadRes = await fetch('/api/vault/upload', {
+            method: 'POST',
+            body: form,
+            // Do NOT set Content-Type — browser sets it with boundary automatically
+          });
+
+          if (!uploadRes.ok) {
+            const errBody = await uploadRes.text();
+            throw new Error(`Upload failed for "${file.name}": ${errBody}`);
+          }
+
+          const uploadData = await uploadRes.json();
+          console.log(
+            `Vault upload: ${uploadData.filename} — ` +
+            `${uploadData.chunks_added} chunks added. ` +
+            `Vault total: ${uploadData.vault_total}`
+          );
+        }
       }
 
-      if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      if (!response.body)  throw new Error('No response body received');
+      // ── Step 2: Send the text query to the firewall pipeline ──────────────
+      // If no query text but files were uploaded, use a default prompt
+      const finalQuery = query.trim() ||
+        `Summarize the key financial facts from the uploaded document.`;
 
+      const response = await fetch('/api/chat', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ query: finalQuery }),
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Backend error ${response.status}: ${errText}`);
+      }
+      if (!response.body) throw new Error('No response body received');
+
+      // ── Step 3: Read SSE stream ───────────────────────────────────────────
       const reader  = response.body.getReader();
       const decoder = new TextDecoder();
       let   buffer  = '';
@@ -59,29 +86,79 @@ export default function Home() {
               const { event_type, data } = JSON.parse(jsonStr);
 
               if (event_type === 'token') {
-                setTokens((p) => [...p, {
-                  id: data.id, text: data.text,
-                  status: data.status ?? 'streaming', timestamp: Date.now(),
+                setTokens((prev) => [...prev, {
+                  id:        data.id,
+                  text:      data.text,
+                  status:    data.status ?? 'streaming',
+                  timestamp: Date.now(),
                 }]);
+
               } else if (event_type === 'correction') {
-                setTokens((p) => p.map((t) =>
-                  t.id === data.id
-                    ? { ...t, status: 'corrected', correction: data.corrected, source: data.source }
-                    : t
-                ));
+                // Backend sends correction by sentence match, not token id
+                // Mark the most recent token that contains the original claim
+                setTokens((prev) => {
+                  const updated  = [...prev];
+                  let   matched  = false;
+
+                  for (let i = updated.length - 1; i >= 0; i--) {
+                    const windowText = updated
+                      .slice(Math.max(0, i - 15), i + 1)
+                      .map((t) => t.text)
+                      .join('');
+
+                    if (
+                      windowText.includes(data.original_claim) ||
+                      updated[i].text.includes(data.original_claim)
+                    ) {
+                      updated[i] = {
+                        ...updated[i],
+                        status:     'corrected',
+                        correction: data.corrected_sentence,
+                        source:     data.source,
+                      };
+                      matched = true;
+                      break;
+                    }
+                  }
+
+                  // Fallback: append correction as new token if not found inline
+                  if (!matched) {
+                    updated.push({
+                      id:         `corr-${Date.now()}`,
+                      text:       data.original_sentence ?? data.original_claim,
+                      status:     'corrected',
+                      correction: data.corrected_sentence,
+                      source:     data.source,
+                      timestamp:  Date.now(),
+                    });
+                  }
+
+                  return updated;
+                });
+
               } else if (event_type === 'stats') {
                 setStats(data as SessionStats);
+
               } else if (event_type === 'done') {
-                if (data?.session_stats) setStats(data.session_stats);
+                if (data?.total_corrections_made !== undefined) {
+                  setStats(data as SessionStats);
+                } else if (data) {
+                  setStats(data as SessionStats);
+                }
                 setIsStreaming(false);
+
               } else if (event_type === 'error') {
-                setError(data?.message ?? 'Unknown error');
+                setError(data?.message ?? 'Unknown pipeline error');
                 setIsStreaming(false);
               }
-            } catch { /* malformed line — skip */ }
+
+            } catch {
+              // Malformed SSE line — skip silently
+            }
           }
         }
       }
+
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Connection failed');
     } finally {
@@ -89,7 +166,7 @@ export default function Home() {
     }
   }, []);
 
-  const showStats = isStreaming || stats !== null || tokens.some(t => t.status === 'corrected');
+  const showStats = isStreaming || stats !== null || tokens.some((t) => t.status === 'corrected');
 
   return (
     <div className="app-shell">
@@ -97,9 +174,9 @@ export default function Home() {
       {/* ── Topbar ──────────────────────────────────── */}
       <header className="topbar">
         <div className="topbar-inner">
-          {/* Logo mark */}
           <div className="logo-mark">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+              strokeLinecap="round" strokeLinejoin="round">
               <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
             </svg>
           </div>
@@ -130,7 +207,6 @@ export default function Home() {
           <h1 className="hero-title">
             Self-Healing <span>Hallucination</span> Firewall
           </h1>
-        
         </div>
 
         {/* Left column */}
@@ -139,8 +215,12 @@ export default function Home() {
 
           {error && (
             <div className="error-banner">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                stroke="currentColor" strokeWidth="2.5"
+                strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="10"/>
+                <line x1="12" y1="8"  x2="12"    y2="12"/>
+                <line x1="12" y1="16" x2="12.01" y2="16"/>
               </svg>
               {error}
             </div>
@@ -156,8 +236,12 @@ export default function Home() {
       {/* ── Footer ──────────────────────────────────── */}
       <footer className="page-footer">
         <div className="footer-inner">
-          <span className="footer-left">XEN-O-THON 2026 · Team Leo · AI &amp; Automation — Beyond Wrappers</span>
-          <span className="footer-right">GTBIT New Delhi · Institution's Innovation Council</span>
+          <span className="footer-left">
+            XEN-O-THON 2026 · Team Leo · AI &amp; Automation — Beyond Wrappers
+          </span>
+          <span className="footer-right">
+            GTBIT New Delhi · Institution's Innovation Council
+          </span>
         </div>
       </footer>
 
