@@ -16,53 +16,26 @@ interface QueryInputProps {
 function getFileType(file: File): AttachedFile['type'] {
   if (file.type === 'application/pdf') return 'pdf';
   if (file.type.startsWith('image/')) return 'image';
-  if (
-    file.type.includes('word') ||
-    file.name.endsWith('.doc') ||
-    file.name.endsWith('.docx')
-  )
-    return 'doc';
+  if (file.type.includes('word') || file.name.endsWith('.doc') || file.name.endsWith('.docx')) return 'doc';
   return 'other';
 }
 
-function FileChip({
-  attachment,
-  onRemove,
-}: {
-  attachment: AttachedFile;
-  onRemove: () => void;
-}) {
-  const icons: Record<AttachedFile['type'], string> = {
-    pdf:   '📄',
-    image: '🖼️',
-    doc:   '📝',
-    other: '📎',
-  };
+const chipIcons: Record<AttachedFile['type'], string> = {
+  pdf: '📄', image: '🖼️', doc: '📝', other: '📎',
+};
 
+function FileChip({ attachment, onRemove }: { attachment: AttachedFile; onRemove: () => void }) {
   return (
     <div className="file-chip">
       {attachment.type === 'image' && attachment.previewUrl ? (
-        <img
-          src={attachment.previewUrl}
-          alt={attachment.file.name}
-          className="chip-img-preview"
-        />
+        <img src={attachment.previewUrl} alt="" className="chip-img-preview" />
       ) : (
-        <span className="chip-icon">{icons[attachment.type]}</span>
+        <span style={{ fontSize: '0.8rem' }}>{chipIcons[attachment.type]}</span>
       )}
       <span className="chip-name">
-        {attachment.file.name.length > 18
-          ? attachment.file.name.slice(0, 15) + '…'
-          : attachment.file.name}
+        {attachment.file.name.length > 20 ? attachment.file.name.slice(0, 17) + '…' : attachment.file.name}
       </span>
-      <button
-        className="chip-remove"
-        onClick={onRemove}
-        title="Remove"
-        type="button"
-      >
-        ×
-      </button>
+      <button className="chip-remove" onClick={onRemove} type="button" title="Remove">×</button>
     </div>
   );
 }
@@ -70,147 +43,111 @@ function FileChip({
 export default function QueryInput({ onSubmit, isLoading }: QueryInputProps) {
   const [value, setValue]             = useState('');
   const [attachments, setAttachments] = useState<AttachedFile[]>([]);
+  const fileRef = useRef<HTMLInputElement>(null);
 
-  const fileInputRef  = useRef<HTMLInputElement>(null);
-  const imageInputRef = useRef<HTMLInputElement>(null);
+  const canSubmit = (value.trim().length > 0 || attachments.length > 0) && !isLoading;
 
   const handleSubmit = () => {
-    const trimmed = value.trim();
-    if ((!trimmed && attachments.length === 0) || isLoading) return;
-    onSubmit(trimmed, attachments);
+    if (!canSubmit) return;
+    onSubmit(value.trim(), attachments);
     setValue('');
     setAttachments([]);
   };
 
-  const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter') handleSubmit();
+  const handleKey = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) handleSubmit();
   };
 
   const addFiles = (files: FileList | null) => {
     if (!files) return;
-    const newAttachments: AttachedFile[] = Array.from(files).map((file) => {
-      const type = getFileType(file);
-      const previewUrl =
-        type === 'image' ? URL.createObjectURL(file) : undefined;
-      return { file, type, previewUrl };
+    const next: AttachedFile[] = Array.from(files).map((f) => {
+      const type = getFileType(f);
+      return { file: f, type, previewUrl: type === 'image' ? URL.createObjectURL(f) : undefined };
     });
-    setAttachments((prev) => [...prev, ...newAttachments]);
+    setAttachments((p) => [...p, ...next]);
   };
 
-  const removeAttachment = (index: number) => {
-    setAttachments((prev) => {
-      const updated = [...prev];
-      if (updated[index].previewUrl) {
-        URL.revokeObjectURL(updated[index].previewUrl!);
-      }
-      updated.splice(index, 1);
-      return updated;
+  const remove = (i: number) => {
+    setAttachments((p) => {
+      const n = [...p];
+      if (n[i].previewUrl) URL.revokeObjectURL(n[i].previewUrl!);
+      n.splice(i, 1);
+      return n;
     });
   };
 
   return (
-    <div className="query-input-wrapper">
-      {/* Attached file chips */}
+    <div className="query-card">
+      {/* Hidden inputs */}
+      <input ref={fileRef}  type="file" accept=".pdf,.doc,.docx,.txt,.csv,.json" multiple style={{ display: 'none' }}
+        onChange={(e) => { addFiles(e.target.files); e.target.value = ''; }} />
+
+      {/* Attached chips */}
       {attachments.length > 0 && (
-        <div className="file-chips-row">
-          {attachments.map((att, i) => (
-            <FileChip
-              key={i}
-              attachment={att}
-              onRemove={() => removeAttachment(i)}
-            />
+        <div className="query-chips-area">
+          {attachments.map((a, i) => (
+            <FileChip key={i} attachment={a} onRemove={() => remove(i)} />
           ))}
         </div>
       )}
 
-      <div className="input-row">
-        {/* Hidden file inputs */}
+      {/* Input row */}
+      <div className="query-input-row">
+        <span className="query-prompt">›</span>
+
         <input
-          ref={fileInputRef}
-          type="file"
-          accept=".pdf,.doc,.docx,.txt,.csv,.json"
-          multiple
-          style={{ display: 'none' }}
-          onChange={(e) => { addFiles(e.target.files); e.target.value = ''; }}
-        />
-        <input
-          ref={imageInputRef}
-          type="file"
-          accept="image/*"
-          multiple
-          style={{ display: 'none' }}
-          onChange={(e) => { addFiles(e.target.files); e.target.value = ''; }}
+          type="text"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={handleKey}
+          placeholder="Ask about financial data, company metrics, legal documents…"
+          disabled={isLoading}
+          className="query-input"
+          autoFocus
         />
 
-        {/* Upload buttons */}
-        <div className="upload-btns">
+        <div className="query-actions">
+          {/* File attach */}
           <button
             type="button"
-            className="upload-btn"
-            title="Attach PDF / DOC / TXT"
-            onClick={() => fileInputRef.current?.click()}
+            className="icon-btn"
+            title="Attach document (PDF, DOC, TXT, CSV)"
+            onClick={() => fileRef.current?.click()}
             disabled={isLoading}
           >
-            {/* File icon */}
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
               <polyline points="14 2 14 8 20 8"/>
               <line x1="12" y1="18" x2="12" y2="12"/>
               <line x1="9" y1="15" x2="15" y2="15"/>
             </svg>
-            <span className="upload-btn-label">File</span>
           </button>
 
+          <div className="icon-btn-divider" />
+
+          {/* Submit */}
           <button
-            type="button"
-            className="upload-btn"
-            title="Attach Image"
-            onClick={() => imageInputRef.current?.click()}
-            disabled={isLoading}
+            onClick={handleSubmit}
+            disabled={!canSubmit}
+            className={`submit-btn ${isLoading ? 'loading' : ''}`}
           >
-            {/* Image icon */}
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-              <circle cx="8.5" cy="8.5" r="1.5"/>
-              <polyline points="21 15 16 10 5 21"/>
-            </svg>
-            <span className="upload-btn-label">Image</span>
+            {isLoading ? (
+              <>
+                <span className="spinner" />
+                Scanning…
+              </>
+            ) : (
+              <>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <line x1="22" y1="2" x2="11" y2="13"/>
+                  <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                </svg>
+                Analyse
+              </>
+            )}
           </button>
         </div>
-
-        {/* Text input */}
-        <div className="input-container">
-          <span className="prompt-symbol">›</span>
-          <input
-            type="text"
-            value={value}
-            onChange={(e) => setValue(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="Ask about financial data, company metrics..."
-            disabled={isLoading}
-            className="query-input"
-            autoFocus
-          />
-        </div>
-
-        {/* Submit */}
-        <button
-          onClick={handleSubmit}
-          disabled={isLoading || (!value.trim() && attachments.length === 0)}
-          className="submit-btn"
-        >
-          {isLoading ? (
-            <span className="spinner-wrap">
-              <span className="spinner" />
-              <span>SCANNING</span>
-            </span>
-          ) : (
-            <span>FIRE</span>
-          )}
-        </button>
       </div>
-
-      <div className="input-underline" />
     </div>
   );
 }
