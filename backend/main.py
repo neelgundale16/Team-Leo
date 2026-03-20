@@ -254,26 +254,49 @@ async def vault_upload(
     source_name: Optional[str] = Form(None)
 ):
     filename = source_name or file.filename or "uploaded_document"
-    lower_name = filename.lower()
-    content_type = (file.content_type or "").lower()
+    content_type = file.content_type or ""
     raw_bytes = await file.read()
+    chunks: list[str] = []
 
-    if "pdf" in content_type or lower_name.endswith(".pdf"):
-        text = extract_text_from_pdf(raw_bytes)
-    elif (
-        "wordprocessingml" in content_type
-        or lower_name.endswith(".docx")
-    ):
-        text = extract_text_from_docx(raw_bytes)
-    elif "text" in content_type or lower_name.endswith(".txt"):
-        text = extract_text_from_txt(raw_bytes)
+    if "pdf" in content_type or filename.lower().endswith(".pdf"):
+        try:
+            import io
+            from pypdf import PdfReader
+
+            reader = PdfReader(io.BytesIO(raw_bytes))
+            for page in reader.pages:
+                text = page.extract_text()
+                if text and text.strip():
+                    words, chunk, chars = text.split(), [], 0
+                    for w in words:
+                        chunk.append(w)
+                        chars += len(w) + 1
+                        if chars >= 500:
+                            chunks.append(" ".join(chunk))
+                            chunk, chars = [], 0
+                    if chunk:
+                        chunks.append(" ".join(chunk))
+        except ImportError:
+            raise HTTPException(status_code=500, detail="Run: pip install pypdf")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"PDF parse error: {e}")
+
     else:
-        raise HTTPException(
-            status_code=400,
-            detail="Supported files: PDF, DOCX, TXT"
-        )
+        try:
+            text = raw_bytes.decode("utf-8")
+            words, chunk, chars = text.split(), [], 0
+            for w in words:
+                chunk.append(w)
+                chars += len(w) + 1
+                if chars >= 500:
+                    chunks.append(" ".join(chunk))
+                    chunk, chars = [], 0
+            if chunk:
+                chunks.append(" ".join(chunk))
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=400, detail="File must be PDF or UTF-8 text")
 
-    if not text:
+    if not chunks:
         raise HTTPException(status_code=400, detail="No text extracted from file")
 
     chunks = chunk_text(text, chunk_size=500)
@@ -287,8 +310,7 @@ async def vault_upload(
         "status": "success",
         "filename": filename,
         "chunks_added": len(chunks),
-        "vault_total": vault.get_count(),
-        "preview": text[:500]
+        "vault_total": vault.get_count()
     })
 
 
@@ -296,8 +318,8 @@ async def vault_upload(
 async def health():
     return {
         "status": "ok",
-        "llm_provider": "OpenAI",
-        "llm_model": "gpt-4.1-mini",
+        "llm_provider": "Groq",
+        "llm_model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
         "vault_documents": vault.get_count(),
         "sentinel_loaded": sentinel._initialized,
         "mock_mode": os.getenv("USE_MOCK", "false"),
