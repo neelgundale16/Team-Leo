@@ -318,8 +318,8 @@ async def vault_upload(
 async def health():
     return {
         "status": "ok",
-        "llm_provider": "Groq",
-        "llm_model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        "llm_provider": "Ollama",
+        "llm_model": "llama3",
         "vault_documents": vault.get_count(),
         "sentinel_loaded": sentinel._initialized,
         "mock_mode": os.getenv("USE_MOCK", "false"),

@@ -8,7 +8,7 @@ from models import NLIResult
 logger = logging.getLogger(__name__)
 
 NLI_MODEL_NAME = "cross-encoder/nli-MiniLM2-L6-H768"
-CONTRADICTION_THRESHOLD = 0.50
+CONTRADICTION_THRESHOLD = 0.30
 
 # Patterns that indicate a fact-seeking sentence
 FACTUAL_PATTERNS = re.compile(

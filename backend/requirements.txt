@@ -17,8 +17,7 @@ sentence-transformers
 # Vector Database
 chromadb
 
-# HTTP Client (async LLM calls + OpenAI SDK)
-openai
+# HTTP Client (async LLM calls)
 httpx
 
 # ── Dev / Testing ──────────────────────────────────────────────────────────────

@@ -1,20 +1,3 @@
-"""
-interceptor.py — Streaming Interceptor with OpenAI Logprob-Based Entropy Detection
-
-Uses the OpenAI API with logprobs=True and top_logprobs=5 to compute
-Shannon entropy at every token position.
-
-H(t) = -sum( p_i * log2(p_i) ) over top-k candidate tokens at position t
-
-High-entropy tokens signal model uncertainty — contiguous high-entropy spans
-are flagged as potential claims to verify. Combined with regex-based detection
-for financial entities and named companies.
-
-References:
-  - Semantic Entropy (Kuhn et al., 2023)
-  - Kernel Language Entropy (ICLR 2024)
-"""
-
 import re
 import json
 import math
@@ -22,155 +5,146 @@ import httpx
 import asyncio
 import logging
 import os
+from collections import deque
 from typing import AsyncGenerator
 from models import Claim
 
 logger = logging.getLogger(__name__)
 
-MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
-MISTRAL_MODEL   = os.getenv("MISTRAL_MODEL", "mistral-small-latest").strip()
+OLLAMA_API_URL = "http://localhost:11434/v1/chat/completions"
+OLLAMA_MODEL = "llama3"
 
-# Shannon entropy threshold — tokens above this are "uncertain"
-# gpt-4o-mini default: 0 = perfectly confident, ~3.0 = very uncertain
-ENTROPY_THRESHOLD = 1.2
+ENTROPY_THRESHOLD = 0.08
+WINDOW_SIZE = 6
+BURST_MIN_TOKENS = 1
 
-# Number of top candidate tokens to request for entropy computation
-TOP_LOGPROBS = 5
-
-# Sentence boundary detector
 SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
 
-# Regex patterns for financial entities (backup/complement to entropy)
-NUMBER_PATTERN = re.compile(
-    r'\$?\b\d+(?:\.\d+)?\s?(?:billion|million|trillion|%|percent)?\b',
-    re.IGNORECASE
-)
-DATE_PATTERN = re.compile(
-    r'\b(?:Q[1-4]\s+\d{4}|FY\s?\d{4}|'
-    r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}|\d{4})\b',
-    re.IGNORECASE
-)
-NAME_PATTERN = re.compile(
-    r'\b(?:Apple|Microsoft|Tesla|Amazon|Nvidia|JPMorgan|Goldman Sachs|'
-    r'Federal Reserve|AWS|Azure|S&P 500|US CPI|OpenAI|Google|Meta|Alphabet)\b',
-    re.IGNORECASE
-)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Shannon Entropy
-# ─────────────────────────────────────────────────────────────────────────────
-def compute_entropy(top_logprobs: list[dict]) -> float:
-    """
-    Compute Shannon entropy from the top-k logprob distribution.
-    H = -sum( p_i * log2(p_i) )
-    Returns 0.0 if no logprobs available.
-    """
-    if not top_logprobs:
+def compute_token_entropy(logprob: float) -> float:
+    if logprob is None:
         return 0.0
-
-    entropy = 0.0
-    for entry in top_logprobs:
-        logprob = entry.get("logprob", -100)
-        p = math.exp(logprob)   # convert log-prob → probability
-        if p > 1e-10:
-            entropy -= p * math.log2(p)
-
-    return entropy
+    p = math.exp(max(logprob, -20.0))
+    if p <= 0:
+        return 0.0
+    return round(-p * math.log(p + 1e-12), 6)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Claim Detection (regex)
-# ─────────────────────────────────────────────────────────────────────────────
-def detect_claims(sentence: str) -> list[Claim]:
-    claims: list[Claim] = []
+def detect_claim_from_span(
+    span_tokens: list,
+    span_entropies: list,
+    sentence: str,
+    position: int
+) -> Claim | None:
+    claim_text = "".join(span_tokens).strip()
+    if not claim_text:
+        return None
 
-    for match in NUMBER_PATTERN.finditer(sentence):
-        claims.append(Claim(
-            text=match.group().strip(),
-            type="number",
-            position=match.start(),
-            sentence=sentence.strip(),
-        ))
+    avg_entropy = sum(span_entropies) / len(span_entropies)
 
-    for match in DATE_PATTERN.finditer(sentence):
-        claims.append(Claim(
-            text=match.group().strip(),
-            type="date",
-            position=match.start(),
-            sentence=sentence.strip(),
-        ))
+    if avg_entropy > 0.20:
+        claim_type = "statistic"
+    elif avg_entropy > 0.16:
+        claim_type = "number"
+    elif avg_entropy > 0.12:
+        claim_type = "name"
+    elif avg_entropy > 0.08:
+        claim_type = "date"
+    else:
+        claim_type = "general"
 
-    for match in NAME_PATTERN.finditer(sentence):
-        claims.append(Claim(
-            text=match.group().strip(),
-            type="name",
-            position=match.start(),
-            sentence=sentence.strip(),
-        ))
-
-    # Deduplicate
-    deduped, seen = [], set()
-    for claim in claims:
-        key = (claim.text.lower(), claim.type, claim.position)
-        if key not in seen:
-            seen.add(key)
-            deduped.append(claim)
-
-    return deduped
+    return Claim(
+        text=claim_text,
+        type=claim_type,
+        position=position,
+        sentence=sentence.strip()
+    )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# OpenAI Streaming (with logprobs)
-# ─────────────────────────────────────────────────────────────────────────────
-async def _stream_openai(query: str) -> AsyncGenerator[tuple[str, float], None]:
-    """
-    Streams tokens from OpenAI with logprobs.
-    Yields (token_text, entropy) tuples.
-    """
-    api_key = os.getenv("MISTRAL_API_KEY", "").strip()
-    if not api_key:
-        raise ValueError("MISTRAL_API_KEY not set in backend/.env")
+def extract_claims_from_entropy(tokens: list, entropies: list, sentence: str) -> list:
+    if not tokens or not entropies:
+        return []
+
+    claims = []
+    in_span = False
+    span_tokens = []
+    span_entropies = []
+    span_start = 0
+
+    for i, (token, entropy) in enumerate(zip(tokens, entropies)):
+        if entropy > ENTROPY_THRESHOLD:
+            if not in_span:
+                in_span = True
+                span_start = i
+                span_tokens = [token]
+                span_entropies = [entropy]
+            else:
+                span_tokens.append(token)
+                span_entropies.append(entropy)
+        else:
+            if in_span and len(span_tokens) >= BURST_MIN_TOKENS:
+                claim = detect_claim_from_span(
+                    span_tokens, span_entropies, sentence, span_start
+                )
+                if claim:
+                    claims.append(claim)
+            in_span = False
+            span_tokens = []
+            span_entropies = []
+
+    if in_span and len(span_tokens) >= BURST_MIN_TOKENS:
+        claim = detect_claim_from_span(
+            span_tokens, span_entropies, sentence, span_start
+        )
+        if claim:
+            claims.append(claim)
+
+    return claims
+
+
+async def _stream_ollama(query: str) -> AsyncGenerator[tuple, None]:
+    # Ollama runs locally — no API key needed
 
     headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type":  "application/json",
+        "Content-Type": "application/json",
     }
 
     payload = {
-        "model":       MISTRAL_MODEL,
+        "model": OLLAMA_MODEL,
         "messages": [
             {
-                "role":    "system",
+                "role": "system",
                 "content": (
-                    "You are a financial analysis assistant. "
-                    "Answer questions about company financials, market data, "
-                    "economic indicators, and uploaded documents clearly and concisely."
-                ),
+                    "You are a financial analysis assistant with deep expertise. "
+                    "Always answer with specific numbers, dollar amounts, percentages, "
+                    "dates, and statistics. Never say you don't have data — provide "
+                    "your best analysis using concrete figures. Include revenue numbers, "
+                    "growth rates, profit margins, and quarterly comparisons. "
+                    "Be assertive and detailed in your response."
+                )
             },
-            {"role": "user", "content": query},
+            {"role": "user", "content": query}
         ],
-        "stream":       True,
-        "temperature":  0.3,
-        "max_tokens":   500,
-        "logprobs":     True,
-        "top_logprobs": TOP_LOGPROBS,
+        "stream": True,
+        "temperature": 0.9,
+        "max_tokens": 800,
+        "logprobs": True,
+        "top_logprobs": 1
     }
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         async with client.stream(
             "POST",
-            MISTRAL_API_URL,
+            OLLAMA_API_URL,
             headers=headers,
-            json=payload,
+            json=payload
         ) as response:
             if response.status_code != 200:
                 body = await response.aread()
                 raise httpx.HTTPStatusError(
-                    f"Mistral returned {response.status_code}: "
-                    f"{body.decode(errors='ignore')[:300]}",
+                    f"Ollama returned {response.status_code}: {body.decode()[:500]}",
                     request=response.request,
-                    response=response,
+                    response=response
                 )
 
             async for line in response.aiter_lines():
@@ -182,21 +156,20 @@ async def _stream_openai(query: str) -> AsyncGenerator[tuple[str, float], None]:
                     break
 
                 try:
-                    chunk  = json.loads(data)
+                    chunk = json.loads(data)
                     choice = chunk["choices"][0]
-                    delta  = choice.get("delta", {})
+                    delta = choice.get("delta", {})
                     content = delta.get("content", "")
                     if not content:
                         continue
 
-                    # Extract logprobs for entropy computation
-                    logprobs_data = choice.get("logprobs") or {}
-                    token_logprobs = logprobs_data.get("content") or []
-
                     entropy = 0.0
-                    if token_logprobs:
-                        top_lp = token_logprobs[0].get("top_logprobs", [])
-                        entropy = compute_entropy(top_lp)
+                    logprobs_obj = choice.get("logprobs")
+                    if logprobs_obj and logprobs_obj.get("content"):
+                        lp_entry = logprobs_obj["content"][0]
+                        lp_val = lp_entry.get("logprob")
+                        if lp_val is not None:
+                            entropy = compute_token_entropy(lp_val)
 
                     yield (content, entropy)
 
@@ -204,104 +177,81 @@ async def _stream_openai(query: str) -> AsyncGenerator[tuple[str, float], None]:
                     continue
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Mock Streaming (for offline demo)
-# ─────────────────────────────────────────────────────────────────────────────
-async def _stream_mock(query: str) -> AsyncGenerator[tuple[str, float], None]:
-    """
-    Mock stream with deliberate hallucinations.
-    Assigns synthetic entropy values — high entropy on wrong numbers.
-    """
+async def _stream_mock(query: str) -> AsyncGenerator[tuple, None]:
     mock_tokens = [
-        ("Apple",     0.1),
-        (" reported", 0.2),
-        (" revenue",  0.3),
-        (" of",       0.1),
-        (" $523",     2.8),   # ← high entropy — hallucinated number
-        (" billion",  2.5),
-        (" in",       0.2),
-        (" fiscal",   0.3),
-        (" year",     0.2),
-        (" 2022",     0.4),
-        (".",         0.1),
-        (" Microsoft",0.1),
-        (" Azure",    0.2),
-        (" grew",     0.3),
-        (" 45%",      2.9),   # ← high entropy — hallucinated percentage
-        (" in",       0.2),
-        (" Q4",       0.4),
-        (" 2023",     0.3),
-        (".",         0.1),
-        (" Tesla",    0.1),
-        (" delivered",0.3),
-        (" 2.1",      2.6),   # ← high entropy — hallucinated delivery count
-        (" million",  2.4),
-        (" vehicles", 0.2),
-        (" in",       0.1),
-        (" 2023",     0.3),
-        (".",         0.1),
+        ("Apple", 0.05), (" reported", 0.06), (" revenue", 0.08), (" of", 0.05),
+        (" $", 0.21), ("523", 0.34), (" billion", 0.31), (".", 0.02),
     ]
     for token, entropy in mock_tokens:
         yield (token, entropy)
         await asyncio.sleep(0.04)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main Generator: stream_and_detect()
-# Called by main.py's firewall pipeline
-# ─────────────────────────────────────────────────────────────────────────────
 async def stream_and_detect(query: str) -> AsyncGenerator[tuple, None]:
-    """
-    Streams tokens with entropy scores.
-    Yields:
-      ("TOKEN:<text>", [])            — for every incoming token
-      ("<sentence>",  [Claim, ...])   — for each completed sentence
-    """
-    use_mock   = os.getenv("USE_MOCK", "false").lower() == "true"
-    stream_fn  = _stream_mock if use_mock else _stream_openai
-
-    text_buffer       = ""
-    token_count       = 0
-    high_entropy_span = []   # accumulates uncertain tokens
+    use_mock = os.getenv("USE_MOCK", "false").lower() == "true"
+    text_buffer = ""
+    token_buffer = []
+    entropy_buffer = []
+    entropy_window = deque(maxlen=WINDOW_SIZE)
+    token_count = 0
+    stream_fn = _stream_mock if use_mock else _stream_ollama
 
     try:
         async for token, entropy in stream_fn(query):
-            token_count  += 1
-            text_buffer  += token
+            token_count += 1
+            text_buffer += token
+            token_buffer.append(token)
+            entropy_buffer.append(entropy)
+            entropy_window.append(entropy)
 
-            # Always yield the raw token for streaming display
             yield (f"TOKEN:{token}", [])
 
-            # Track high-entropy spans
-            if entropy >= ENTROPY_THRESHOLD:
-                high_entropy_span.append(token)
-                logger.debug(
-                    f"High entropy token: '{token.strip()}' H={entropy:.3f}"
-                )
-            else:
-                if high_entropy_span:
-                    span_text = "".join(high_entropy_span).strip()
-                    logger.info(
-                        f"High-entropy span detected: '{span_text}' "
-                        f"({len(high_entropy_span)} tokens)"
-                    )
-                high_entropy_span = []
-
-            # Check for sentence completion
             parts = SENTENCE_END.split(text_buffer)
             if len(parts) > 1:
                 for sentence in parts[:-1]:
                     sentence = sentence.strip()
                     if not sentence:
                         continue
-                    claims = detect_claims(sentence)
+
+                    char_count = 0
+                    sentence_tokens = []
+                    sentence_entropies = []
+                    for tok, ent in zip(token_buffer, entropy_buffer):
+                        if char_count >= len(sentence):
+                            break
+                        sentence_tokens.append(tok)
+                        sentence_entropies.append(ent)
+                        char_count += len(tok)
+
+                    claims = extract_claims_from_entropy(
+                        sentence_tokens, sentence_entropies, sentence
+                    )
+
+                    logger.debug(
+                        f"Sentence: '{sentence[:60]}' | "
+                        f"Claims: {len(claims)} | "
+                        f"Peak H: {max(sentence_entropies, default=0):.3f}"
+                    )
                     yield (sentence, claims)
 
                 text_buffer = parts[-1]
+                remaining_len = len(text_buffer)
+                char_count = 0
+                new_toks, new_ents = [], []
+                for tok, ent in zip(reversed(token_buffer), reversed(entropy_buffer)):
+                    if char_count >= remaining_len:
+                        break
+                    new_toks.insert(0, tok)
+                    new_ents.insert(0, ent)
+                    char_count += len(tok)
 
-        # Flush remaining buffer
+                token_buffer = new_toks
+                entropy_buffer = new_ents
+
         if text_buffer.strip():
-            claims = detect_claims(text_buffer.strip())
+            claims = extract_claims_from_entropy(
+                token_buffer, entropy_buffer, text_buffer.strip()
+            )
             yield (text_buffer.strip(), claims)
 
     except ValueError as e:
@@ -309,12 +259,12 @@ async def stream_and_detect(query: str) -> AsyncGenerator[tuple, None]:
         yield (f"ERROR:{str(e)}", [])
 
     except httpx.HTTPStatusError as e:
-        logger.error(f"OpenAI API error: {e}")
+        logger.error(f"Ollama API error: {e}")
         yield (f"ERROR:{str(e)}", [])
 
     except httpx.ConnectError:
-        logger.error("Cannot reach Mistral API")
-        yield ("ERROR:Cannot reach Mistral API. Check your internet connection.", [])
+        logger.error("Cannot reach Ollama server")
+        yield ("ERROR:Cannot reach Ollama. Run: ollama serve", [])
 
     except Exception as e:
         logger.error(f"Interceptor error: {e}", exc_info=True)
