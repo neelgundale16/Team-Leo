@@ -1,14 +1,18 @@
+# main.py
+
 import json
 import time
 import uuid
 import logging
 import os
+from io import BytesIO
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator, Optional
+
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
-from contextlib import asynccontextmanager
-from dotenv import load_dotenv
-from typing import AsyncGenerator, Optional
 
 from models import ChatRequest, StreamToken, SessionStats
 from vault import vault, load_demo_financial_data
@@ -17,6 +21,7 @@ from rewriter import rewriter
 from interceptor import stream_and_detect
 
 load_dotenv()
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
@@ -58,44 +63,12 @@ def sse(event_type: str, data: dict) -> str:
     return f"data: {json.dumps({'event_type': event_type, 'data': data})}\n\n"
 
 
-def build_augmented_query(query: str) -> str:
-    """
-    Pull relevant context from vault and inject it into the prompt
-    before sending anything to the LLM.
-    """
-    vault_result = vault.search(query)
-
-    if not vault_result:
-        return (
-            "You are Project Veracity, a grounded financial and document-analysis assistant.\n"
-            "Answer the user's question clearly.\n"
-            "If you do not have enough grounded context, say so plainly.\n\n"
-            f"User query: {query}"
-        )
-
-    return (
-        "You are Project Veracity, a grounded document-analysis assistant.\n"
-        "Use the provided ground-truth vault context as the primary source of truth.\n"
-        "Do not claim that no document was uploaded if context is provided below.\n"
-        "Answer only from the grounded context when possible.\n"
-        "If the answer is not in the context, say that the uploaded/grounded document "
-        "does not contain enough information.\n\n"
-        f"User query: {query}\n\n"
-        "GROUND-TRUTH CONTEXT:\n"
-        f"{vault_result.matched_text}\n\n"
-        f"SOURCE DOCUMENT: {vault_result.source_document}"
-    )
-
-
 async def firewall_generator(query: str) -> AsyncGenerator[str, None]:
     stats = SessionStats()
     pipeline_start = time.perf_counter()
 
     try:
-        augmented_query = build_augmented_query(query)
-        logger.info(f"Augmented query built for: '{query[:80]}'")
-
-        async for raw, claims in stream_and_detect(augmented_query):
+        async for raw, claims in stream_and_detect(query):
 
             if raw.startswith("TOKEN:"):
                 token_text = raw[6:]
@@ -104,7 +77,7 @@ async def firewall_generator(query: str) -> AsyncGenerator[str, None]:
                     text=token_text,
                     status="streaming"
                 )
-                yield sse("token", token_event.model_dump())
+                yield sse("token", token_event.dict())
                 continue
 
             if raw.startswith("ERROR:"):
@@ -127,6 +100,7 @@ async def firewall_generator(query: str) -> AsyncGenerator[str, None]:
                 vault_result = vault.search(claim.text)
                 if vault_result is None:
                     stats.claims_verified += 1
+                    yield sse("stats", stats.dict())
                     continue
 
                 nli_result = sentinel.classify(
@@ -148,12 +122,21 @@ async def firewall_generator(query: str) -> AsyncGenerator[str, None]:
 
                 if nli_result.is_hallucination:
                     stats.hallucinations_found += 1
-                    corrected = rewriter.rewrite(claim.sentence, vault_result, nli_result)
+                    corrected = rewriter.rewrite(
+                        claim.sentence,
+                        vault_result,
+                        nli_result
+                    )
                     payload = rewriter.build_correction_payload(
-                        claim.sentence, corrected, vault_result.source_document
+                        claim.sentence,
+                        corrected,
+                        vault_result.source_document
                     )
                     stats.corrections_made += 1
-                    logger.info(f"CORRECTED | '{claim.text}' → {vault_result.source_document}")
+
+                    logger.info(
+                        f"CORRECTED | '{claim.text}' → {vault_result.source_document}"
+                    )
 
                     yield sse("correction", {
                         "original_claim": claim.text,
@@ -166,7 +149,7 @@ async def firewall_generator(query: str) -> AsyncGenerator[str, None]:
                         "diff_ratio": payload.get("diff_ratio", 0),
                     })
 
-                yield sse("stats", stats.model_dump())
+                yield sse("stats", stats.dict())
 
         stats.total_pipeline_latency_ms = (time.perf_counter() - pipeline_start) * 1000
         logger.info(
@@ -174,11 +157,77 @@ async def firewall_generator(query: str) -> AsyncGenerator[str, None]:
             f"corrections:{stats.corrections_made} "
             f"total:{stats.total_pipeline_latency_ms:.0f}ms"
         )
-        yield sse("done", stats.model_dump())
+        yield sse("done", stats.dict())
 
     except Exception as e:
         logger.error(f"Pipeline error: {e}", exc_info=True)
         yield sse("error", {"message": str(e)})
+
+
+def chunk_text(text: str, chunk_size: int = 500) -> list[str]:
+    words = text.split()
+    chunks = []
+    chunk = []
+    chars = 0
+
+    for word in words:
+        chunk.append(word)
+        chars += len(word) + 1
+        if chars >= chunk_size:
+            chunks.append(" ".join(chunk))
+            chunk = []
+            chars = 0
+
+    if chunk:
+        chunks.append(" ".join(chunk))
+
+    return chunks
+
+
+def extract_text_from_pdf(raw_bytes: bytes) -> str:
+    try:
+        import pypdf
+    except ImportError:
+        raise HTTPException(status_code=500, detail="Run: pip install pypdf")
+
+    try:
+        reader = pypdf.PdfReader(BytesIO(raw_bytes))
+        pages = []
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            if text.strip():
+                pages.append(text)
+        return "\n".join(pages).strip()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"PDF parse error: {e}")
+
+
+def extract_text_from_docx(raw_bytes: bytes) -> str:
+    try:
+        from docx import Document
+    except ImportError:
+        raise HTTPException(status_code=500, detail="Run: pip install python-docx")
+
+    try:
+        doc = Document(BytesIO(raw_bytes))
+        parts = [p.text for p in doc.paragraphs if p.text.strip()]
+
+        for table in doc.tables:
+            for row in table.rows:
+                row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                if row_text:
+                    parts.append(row_text)
+
+        return "\n".join(parts).strip()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"DOCX parse error: {e}")
+
+
+def extract_text_from_txt(raw_bytes: bytes) -> str:
+    try:
+        return raw_bytes.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="Text file must be UTF-8 encoded")
 
 
 @app.post("/chat")
@@ -205,50 +254,31 @@ async def vault_upload(
     source_name: Optional[str] = Form(None)
 ):
     filename = source_name or file.filename or "uploaded_document"
-    content_type = file.content_type or ""
+    lower_name = filename.lower()
+    content_type = (file.content_type or "").lower()
     raw_bytes = await file.read()
-    chunks: list[str] = []
 
-    if "pdf" in content_type or filename.lower().endswith(".pdf"):
-        try:
-            import io
-            from pypdf import PdfReader
-
-            reader = PdfReader(io.BytesIO(raw_bytes))
-            for page in reader.pages:
-                text = page.extract_text()
-                if text and text.strip():
-                    words, chunk, chars = text.split(), [], 0
-                    for w in words:
-                        chunk.append(w)
-                        chars += len(w) + 1
-                        if chars >= 500:
-                            chunks.append(" ".join(chunk))
-                            chunk, chars = [], 0
-                    if chunk:
-                        chunks.append(" ".join(chunk))
-        except ImportError:
-            raise HTTPException(status_code=500, detail="Run: pip install pypdf")
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"PDF parse error: {e}")
-
+    if "pdf" in content_type or lower_name.endswith(".pdf"):
+        text = extract_text_from_pdf(raw_bytes)
+    elif (
+        "wordprocessingml" in content_type
+        or lower_name.endswith(".docx")
+    ):
+        text = extract_text_from_docx(raw_bytes)
+    elif "text" in content_type or lower_name.endswith(".txt"):
+        text = extract_text_from_txt(raw_bytes)
     else:
-        try:
-            text = raw_bytes.decode("utf-8")
-            words, chunk, chars = text.split(), [], 0
-            for w in words:
-                chunk.append(w)
-                chars += len(w) + 1
-                if chars >= 500:
-                    chunks.append(" ".join(chunk))
-                    chunk, chars = [], 0
-            if chunk:
-                chunks.append(" ".join(chunk))
-        except UnicodeDecodeError:
-            raise HTTPException(status_code=400, detail="File must be PDF or UTF-8 text")
+        raise HTTPException(
+            status_code=400,
+            detail="Supported files: PDF, DOCX, TXT"
+        )
 
-    if not chunks:
+    if not text:
         raise HTTPException(status_code=400, detail="No text extracted from file")
+
+    chunks = chunk_text(text, chunk_size=500)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="No usable chunks created from file")
 
     vault.add_documents_bulk(chunks, filename)
     logger.info(f"Uploaded '{filename}' | {len(chunks)} chunks → vault")
@@ -257,7 +287,8 @@ async def vault_upload(
         "status": "success",
         "filename": filename,
         "chunks_added": len(chunks),
-        "vault_total": vault.get_count()
+        "vault_total": vault.get_count(),
+        "preview": text[:500]
     })
 
 
@@ -265,8 +296,8 @@ async def vault_upload(
 async def health():
     return {
         "status": "ok",
-        "llm_provider": "Groq",
-        "llm_model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        "llm_provider": "OpenAI",
+        "llm_model": "gpt-4.1-mini",
         "vault_documents": vault.get_count(),
         "sentinel_loaded": sentinel._initialized,
         "mock_mode": os.getenv("USE_MOCK", "false"),
@@ -283,8 +314,10 @@ async def vault_count():
 async def vault_add(payload: dict):
     text = payload.get("text", "").strip()
     source = payload.get("source", "manual_entry")
+
     if not text:
         raise HTTPException(status_code=400, detail="text field required")
+
     vault.add_document(text=text, source_name=source)
     return {"status": "added", "vault_total": vault.get_count()}
 
