@@ -206,7 +206,6 @@ async def vault_upload(
 ):
     filename = source_name or file.filename or "uploaded_document"
     content_type = file.content_type or ""
-<<<<<<< HEAD
 
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file was received. Please attach a file before uploading.")
@@ -216,22 +215,6 @@ async def vault_upload(
     if not raw_bytes:
         raise HTTPException(status_code=400, detail=f"File '{filename}' appears to be empty. Please upload a file with content.")
 
-    chunks: list = []
-
-    if "pdf" in content_type or filename.lower().endswith(".pdf"):
-        try:
-            import pypdf, io as _io
-        except ImportError:
-            raise HTTPException(
-                status_code=500,
-                detail="pypdf is not installed on the server. Run: pip install pypdf"
-            )
-        try:
-            reader = pypdf.PdfReader(_io.BytesIO(raw_bytes))
-            if len(reader.pages) == 0:
-                raise HTTPException(status_code=400, detail=f"'{filename}' has no pages.")
-=======
-    raw_bytes = await file.read()
     chunks: list[str] = []
 
     if "pdf" in content_type or filename.lower().endswith(".pdf"):
@@ -240,7 +223,10 @@ async def vault_upload(
             from pypdf import PdfReader
 
             reader = PdfReader(io.BytesIO(raw_bytes))
->>>>>>> b88d840df44c4a067b32a7bec0fcf549dce26d8d
+
+            if len(reader.pages) == 0:
+                raise HTTPException(status_code=400, detail=f"'{filename}' has no pages.")
+
             for page in reader.pages:
                 text = page.extract_text()
                 if text and text.strip():
@@ -253,21 +239,15 @@ async def vault_upload(
                             chunk, chars = [], 0
                     if chunk:
                         chunks.append(" ".join(chunk))
-<<<<<<< HEAD
         except HTTPException:
             raise
+        except ImportError:
+            raise HTTPException(status_code=500, detail="pypdf is not installed. Run: pip install pypdf")
         except Exception as e:
             raise HTTPException(
                 status_code=400,
                 detail=f"Could not read '{filename}'. It may be encrypted, corrupted, or a scanned image-only PDF. Error: {e}"
             )
-=======
-        except ImportError:
-            raise HTTPException(status_code=500, detail="Run: pip install pypdf")
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"PDF parse error: {e}")
-
->>>>>>> b88d840df44c4a067b32a7bec0fcf549dce26d8d
     else:
         try:
             text = raw_bytes.decode("utf-8")
@@ -281,7 +261,6 @@ async def vault_upload(
             if chunk:
                 chunks.append(" ".join(chunk))
         except UnicodeDecodeError:
-<<<<<<< HEAD
             raise HTTPException(
                 status_code=400,
                 detail=f"'{filename}' could not be decoded. File must be a PDF or a plain UTF-8 text file."
@@ -292,29 +271,16 @@ async def vault_upload(
             status_code=400,
             detail=f"No text could be extracted from '{filename}'. It may be a scanned image PDF with no selectable text."
         )
-=======
-            raise HTTPException(status_code=400, detail="File must be PDF or UTF-8 text")
-
-    if not chunks:
-        raise HTTPException(status_code=400, detail="No text extracted from file")
->>>>>>> b88d840df44c4a067b32a7bec0fcf549dce26d8d
 
     vault.add_documents_bulk(chunks, filename)
     logger.info(f"Uploaded '{filename}' | {len(chunks)} chunks → vault")
 
     return JSONResponse({
-<<<<<<< HEAD
-        "status":       "success",
-        "filename":     filename,
-        "chunks_added": len(chunks),
-        "vault_total":  vault.get_count(),
-        "message":      f"Successfully loaded {len(chunks)} facts from '{filename}' into the vault."
-=======
         "status": "success",
         "filename": filename,
         "chunks_added": len(chunks),
-        "vault_total": vault.get_count()
->>>>>>> b88d840df44c4a067b32a7bec0fcf549dce26d8d
+        "vault_total": vault.get_count(),
+        "message": f"Successfully loaded {len(chunks)} facts from '{filename}' into the vault."
     })
 
 
@@ -322,8 +288,8 @@ async def vault_upload(
 async def health():
     return {
         "status": "ok",
-        "llm_provider": "Groq",
-        "llm_model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        "llm_provider": "Mistral",
+        "llm_model": os.getenv("MISTRAL_MODEL", "mistral-small-latest"),
         "vault_documents": vault.get_count(),
         "sentinel_loaded": sentinel._initialized,
         "mock_mode": os.getenv("USE_MOCK", "false"),
