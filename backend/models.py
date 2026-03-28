@@ -1,108 +1,106 @@
-# models.py — All Pydantic Data Models for Project Veracity
-# THIS FILE IS IMPORTED BY EVERY OTHER FILE — build it first
-# Team: Leo | Hackathon: XEN-O-THON 2026
-
+"""
+models.py — Pydantic schemas for Veracity AI
+Covers both self-healing firewall AND adaptive evaluation framework.
+"""
 from pydantic import BaseModel, Field
-from typing import Optional, Literal
+from typing import Optional, Literal, List, Dict
 from datetime import datetime
 
 
-# ═══════════════════════════════════════════════════════
-# MODEL 1 — ChatRequest
-# What the user sends to the API
-# ═══════════════════════════════════════════════════════
+# ── Request Models ─────────────────────────────────────────────────────────────
+
 class ChatRequest(BaseModel):
-    query: str                          # e.g. "What was Apple's revenue in 2022?"
-    session_id: Optional[str] = None    # optional session tracking
-
-
-# ═══════════════════════════════════════════════════════
-# MODEL 2 — Claim
-# A factual claim detected inside the LLM stream
-# e.g. "$523 billion" or "Apple Inc" or "fiscal year 2022"
-# ═══════════════════════════════════════════════════════
-class Claim(BaseModel):
-    text: str                           # the detected claim text
-    type: Literal[                      # what kind of claim is it?
-        "number",
-        "name",
-        "date",
-        "policy",
-        "statistic",
-        "general"
-    ]
-    position: int                       # character position in the stream
-    sentence: str                       # full sentence containing this claim
-
-
-# ═══════════════════════════════════════════════════════
-# MODEL 3 — VaultResult
-# What ChromaDB returns after a semantic search
-# ═══════════════════════════════════════════════════════
-class VaultResult(BaseModel):
-    matched_text: str                   # best matching fact from vault
-    source_document: str                # e.g. "apple_annual_report.pdf"
-    similarity_score: float             # 0 to 1 → higher = more similar
-    distance: float                     # raw ChromaDB distance value
-
-
-# ═══════════════════════════════════════════════════════
-# MODEL 4 — NLIResult
-# What the HaluGate Sentinel returns after NLI classification
-# Entailment = fact is supported | Contradiction = hallucination!
-# ═══════════════════════════════════════════════════════
-class NLIResult(BaseModel):
-    label: Literal[
-        "entailment",
-        "neutral",
-        "contradiction"
-    ]
-    confidence: float                   # how confident is the model?
-    entailment_score: float             # probability it's supported
-    neutral_score: float                # probability it's neutral
-    contradiction_score: float          # probability it's a hallucination
-    is_hallucination: bool              # True if contradiction detected
-
-
-# ═══════════════════════════════════════════════════════
-# MODEL 5 — VerificationResult
-# The full result of checking one claim through the pipeline
-# claim → vault search → NLI check → correction (if needed)
-# ═══════════════════════════════════════════════════════
-class VerificationResult(BaseModel):
-    claim: Claim                                    # the original claim
-    vault_result: Optional[VaultResult] = None      # what vault found
-    nli_result: Optional[NLIResult] = None          # what sentinel decided
-    corrected_sentence: Optional[str] = None        # fixed sentence
-    was_corrected: bool = False                     # did we fix anything?
-    latency_ms: float = 0.0                         # how long it took (ms)
-
-
-# ═══════════════════════════════════════════════════════
-# MODEL 6 — StreamToken
-# Each token that gets sent to the frontend via SSE
-# status tells frontend: verified=green, corrected=highlight
-# ═══════════════════════════════════════════════════════
-class StreamToken(BaseModel):
-    id: str                             # unique token ID e.g. "tok_42"
-    text: str                           # the actual text content
-    status: Literal[
-        "streaming",                    # still coming in
-        "verified",                     # checked, no hallucination
-        "corrected",                    # was wrong, now fixed ✓
-        "skipped"                       # non-factual, skipped check
-    ] = "streaming"
-    correction: Optional[str] = None    # the corrected text (if any)
-    source: Optional[str] = None        # source PDF that proved the fix
-    timestamp: float = Field(           # auto-set to current time
-        default_factory=lambda: datetime.now().timestamp()
+    query: str = Field(..., description="User query")
+    session_id: Optional[str] = None
+    models: Optional[List[str]] = Field(
+        default=["gemini-1.5-flash", "gemini-2.0-flash-lite"],
+        description="Models to evaluate against each other"
+    )
+    eval_mode: bool = Field(
+        default=False,
+        description="Run full multi-model evaluation framework"
     )
 
 
-# ═══════════════════════════════════════════════════════
-# MODEL 7 — SessionStats
-# Running statistics shown in the UI stats panel
-# ═══════════════════════════════════════════════════════
+# ── Claim Detection ────────────────────────────────────────────────────────────
+
+class Claim(BaseModel):
+    text: str
+    type: Literal["number", "name", "date", "policy", "statistic", "general"] = "general"
+    position: int
+    sentence: str
+    entropy: float = 0.0
+
+
+# ── Vault ──────────────────────────────────────────────────────────────────────
+
+class VaultResult(BaseModel):
+    matched_text: str
+    source_document: str
+    similarity_score: float
+    distance: float
+
+
+# ── NLI ───────────────────────────────────────────────────────────────────────
+
+class NLIResult(BaseModel):
+    label: Literal["entailment", "neutral", "contradiction"]
+    confidence: float
+    entailment_score: float
+    neutral_score: float
+    contradiction_score: float
+    is_hallucination: bool
+
+
+# ── Token Stream ───────────────────────────────────────────────────────────────
+
+class StreamToken(BaseModel):
+    id: str
+    text: str
+    status: Literal["streaming", "verified", "corrected", "skipped", "high_entropy"] = "streaming"
+    entropy: float = 0.0
+    correction: Optional[str] = None
+    source: Optional[str] = None
+    timestamp: float = Field(default_factory=lambda: datetime.now().timestamp())
+
+
+# ── Evaluation Dimensions ──────────────────────────────────────────────────────
+
+class EvalDimension(BaseModel):
+    name: str
+    score: float = Field(..., ge=0.0, le=1.0, description="Score 0-1")
+    rationale: str
+    evidence: Optional[str] = None
+
+
+class ModelEvalResult(BaseModel):
+    model_id: str
+    model_label: str
+    response_text: str
+    tokens_total: int
+    hallucination_rate: float          # % high-entropy tokens
+    avg_token_entropy: float
+    peak_entropy: float
+    dimensions: Dict[str, EvalDimension]  # factuality, reasoning, instruction_following, coherence
+    overall_score: float
+    corrections_applied: int
+    corrected_response: Optional[str] = None
+    latency_ms: float
+    judge_verdict: Optional[str] = None   # LLM-as-judge summary
+
+
+class ComparisonResult(BaseModel):
+    query: str
+    session_id: str
+    models: List[ModelEvalResult]
+    winner: str                           # model_id of winner
+    winner_rationale: str
+    dimension_winner: Dict[str, str]      # per-dimension winners
+    timestamp: float = Field(default_factory=lambda: datetime.now().timestamp())
+
+
+# ── Session Stats ──────────────────────────────────────────────────────────────
+
 class SessionStats(BaseModel):
     total_claims_detected: int = 0
     claims_verified: int = 0
@@ -111,41 +109,15 @@ class SessionStats(BaseModel):
     corrections_made: int = 0
     avg_verification_latency_ms: float = 0.0
     total_pipeline_latency_ms: float = 0.0
+    model_id: Optional[str] = None
 
 
-# ═══════════════════════════════════════════════════════
-# MODEL 8 — SSEEvent
-# The wrapper for every Server-Sent Event to the frontend
-# event_type tells frontend how to handle the data
-# ═══════════════════════════════════════════════════════
+# ── SSE Events ─────────────────────────────────────────────────────────────────
+
 class SSEEvent(BaseModel):
     event_type: Literal[
-        "token",        # a new word/chunk arrived
-        "correction",   # a hallucination was fixed
-        "stats",        # updated statistics
-        "done",         # stream finished
-        "error"         # something went wrong
+        "token", "correction", "stats", "done", "error",
+        "eval_start", "eval_progress", "eval_complete", "model_done"
     ]
-    data: dict          # the actual payload (flexible)
-# ```
-
-# ---
-
-# ### 🔍 Key Things to Understand
-
-# **Why `Literal[...]`?**
-# It means only those exact values are allowed. If sentinel.py accidentally sends `label="wrong"` instead of `"entailment"`, Pydantic throws an error immediately. Catches bugs early.
-
-# **Why `Optional[X] = None`?**
-# Some fields only exist sometimes. `vault_result` is `None` if the vault found nothing. `corrected_sentence` is `None` if no correction was needed.
-
-# **Why `Field(default_factory=...)`?**
-# For `timestamp` — you can't write `default=datetime.now().timestamp()` because that runs once at import time. `default_factory` runs it fresh every time a new token is created.
-
-# ---
-
-# ### ✅ Self-Check Before Task 2
-# ```
-# □ File saved at backend/models.py
-# □ 8 classes exist in the file
-# □ No syntax errors (run: python models.py — should print nothing)
+    data: dict
+    model_id: Optional[str] = None
