@@ -150,4 +150,181 @@ export default function QueryInput({ onSubmit, isLoading }: QueryInputProps) {
       </div>
     </div>
   );
+}'use client'
+
+import { useState, KeyboardEvent, useRef } from 'react'
+import { AppMode } from '../types'
+
+export interface AttachedFile {
+  file: File
+  type: 'pdf' | 'image' | 'doc' | 'other'
+  previewUrl?: string
+}
+
+function getFileType(file: File): AttachedFile['type'] {
+  if (file.type === 'application/pdf') return 'pdf'
+  if (file.type.startsWith('image/')) return 'image'
+  if (file.type.includes('word') || file.name.endsWith('.doc') || file.name.endsWith('.docx')) return 'doc'
+  return 'other'
+}
+
+const CHIP_ICONS: Record<AttachedFile['type'], string> = {
+  pdf: '📄', image: '🖼️', doc: '📝', other: '📎',
+}
+
+interface QueryInputProps {
+  onSubmit:   (query: string, attachments: AttachedFile[], mode: AppMode) => void
+  isLoading:  boolean
+  mode:       AppMode
+  onModeChange: (mode: AppMode) => void
+}
+
+export default function QueryInput({
+  onSubmit, isLoading, mode, onModeChange
+}: QueryInputProps) {
+  const [value, setValue]             = useState('')
+  const [attachments, setAttachments] = useState<AttachedFile[]>([])
+  const fileRef = useRef<HTMLInputElement>(null)
+
+  const canSubmit = (value.trim().length > 0 || attachments.length > 0) && !isLoading
+
+  const handleSubmit = () => {
+    if (!canSubmit) return
+    onSubmit(value.trim(), attachments, mode)
+    setValue('')
+    setAttachments([])
+  }
+
+  const handleKey = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) handleSubmit()
+  }
+
+  const addFiles = (files: FileList | null) => {
+    if (!files) return
+    const next = Array.from(files).map((f) => ({
+      file: f,
+      type: getFileType(f),
+      previewUrl: f.type.startsWith('image/') ? URL.createObjectURL(f) : undefined,
+    })) as AttachedFile[]
+    setAttachments((p) => [...p, ...next])
+  }
+
+  const remove = (i: number) => {
+    setAttachments((p) => {
+      const n = [...p]
+      if (n[i].previewUrl) URL.revokeObjectURL(n[i].previewUrl!)
+      n.splice(i, 1)
+      return n
+    })
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      {/* Mode toggle */}
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+        <div className="mode-tabs">
+          <button
+            className={`mode-tab${mode === 'firewall' ? ' active' : ''}`}
+            onClick={() => onModeChange('firewall')}
+            type="button"
+          >
+            🛡 Firewall
+          </button>
+          <button
+            className={`mode-tab${mode === 'eval' ? ' active' : ''}`}
+            onClick={() => onModeChange('eval')}
+            type="button"
+          >
+            ⚖️ Evaluate
+          </button>
+        </div>
+        <span style={{ fontSize: '0.72rem', color: 'var(--text-3)' }}>
+          {mode === 'firewall'
+            ? 'Real-time hallucination correction'
+            : 'Gemini Flash vs Gemini 2.0 comparison'}
+        </span>
+      </div>
+
+      {/* Query card */}
+      <div className="query-card">
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".pdf,.doc,.docx,.txt,.csv,.json"
+          multiple
+          style={{ display: 'none' }}
+          onChange={(e) => { addFiles(e.target.files); e.target.value = '' }}
+        />
+
+        {attachments.length > 0 && (
+          <div className="query-chips-area">
+            {attachments.map((a, i) => (
+              <div key={i} className="file-chip">
+                <span style={{ fontSize: '0.75rem' }}>{CHIP_ICONS[a.type]}</span>
+                <span className="chip-name">
+                  {a.file.name.length > 20 ? a.file.name.slice(0, 17) + '…' : a.file.name}
+                </span>
+                <button className="chip-remove" onClick={() => remove(i)} type="button">×</button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="query-input-row">
+          <span className="query-prompt">›</span>
+          <input
+            type="text"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={handleKey}
+            placeholder={
+              mode === 'firewall'
+                ? 'Ask about financial data, company metrics, market rates…'
+                : 'Enter a query to compare both models against each other…'
+            }
+            disabled={isLoading}
+            className="query-input"
+            autoFocus
+          />
+          <div className="query-actions">
+            <button
+              type="button"
+              className="icon-btn"
+              title="Attach document"
+              onClick={() => fileRef.current?.click()}
+              disabled={isLoading}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
+                stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+                <line x1="12" y1="18" x2="12" y2="12"/>
+                <line x1="9"  y1="15" x2="15" y2="15"/>
+              </svg>
+            </button>
+            <div className="icon-btn-divider" />
+            <button
+              onClick={handleSubmit}
+              disabled={!canSubmit}
+              className={`submit-btn${isLoading ? ' loading' : ''}`}
+              type="button"
+            >
+              {isLoading ? (
+                <><span className="spinner" /> {mode === 'eval' ? 'Evaluating…' : 'Scanning…'}</>
+              ) : (
+                <>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none"
+                    stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <line x1="22" y1="2" x2="11" y2="13"/>
+                    <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                  </svg>
+                  {mode === 'eval' ? 'Evaluate' : 'Analyse'}
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
 }
