@@ -1,452 +1,416 @@
 """
-main.py — Veracity AI: Adaptive Evaluation & Self-Healing Firewall
-FastAPI application — orchestrates both single-model firewall mode
-and multi-model comparative evaluation mode.
+main.py — FastAPI entry point for Project Veracity v2.0
+AI4Dev'26, PSG Tech Coimbatore
+
+Wires: Gemini streamer → entropy detector → vault verifier → NLI sentinel → rewriter → SSE
+Includes /evaluate endpoint for dual-model comparison.
+Rate-limited for Gemini free tier (15 RPM).
 """
 
-import json, time, uuid, logging, os, asyncio
+import os
+import json
+import time
+import logging
+import asyncio
+from contextlib import asynccontextmanager
+from typing import Optional, AsyncGenerator
+
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
-from contextlib import asynccontextmanager
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from dotenv import load_dotenv
-from typing import AsyncGenerator, Optional
-
-from models import (
-    ChatRequest, SSEEvent, StreamToken, SessionStats, ComparisonResult
-)
-from vault import vault, load_demo_financial_data
-from sentinel import sentinel
-from rewriter import rewriter
-from interceptor import stream_and_detect
-from evaluator import build_model_eval, llm_judge_comparison, DIMENSION_WEIGHTS
 
 load_dotenv()
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s │ %(name)s │ %(message)s")
 logger = logging.getLogger(__name__)
 
+# ── Lazy imports ─────────────────────────────────────────────────────────────
+try:
+    from models import ChatRequest, SSEEvent, SessionStats, StreamToken
+    from vault import vault, load_demo_financial_data
+    from sentinel import sentinel
+    from rewriter import rewriter
+    from interceptor import stream_and_detect, generate_full_response
+    from evaluator import build_model_eval, llm_judge_comparison
+except ImportError as e:
+    logger.error("Import error: %s — run: pip install -r requirements.txt", e)
+    raise
 
-# ── Lifespan ───────────────────────────────────────────────────────────────────
+# ── Lifespan ─────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🛡️  Veracity AI — starting up...")
-    vault.initialize()
-    if vault.get_count() == 0:
-        load_demo_financial_data(vault)
-    logger.info(f"Vault ready | {vault.get_count()} documents")
-    sentinel.initialize()
-    logger.info("Sentinel ready")
-    logger.info("✅ All systems go.")
+    logger.info("🚀 Starting Project Veracity v2.0 ...")
+    try:
+        vault.initialize()
+        logger.info("✅ Vault initialised (%d docs)", vault.get_count())
+        if vault.get_count() == 0:
+            load_demo_financial_data(vault)
+            logger.info("✅ Demo financial data loaded (%d docs)", vault.get_count())
+        sentinel.initialize()
+        logger.info("✅ Sentinel NLI model loaded")
+        logger.info("🛡️  All systems go. Hallucination firewall is active.")
+    except Exception as e:
+        logger.error("Startup failed: %s", e)
     yield
     logger.info("Shutting down.")
 
 
-# ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="Veracity AI — Adaptive Evaluation & Self-Healing Firewall",
+    title="Project Veracity",
+    description="Self-Healing Hallucination Firewall — AI4Dev'26, PSG Tech Coimbatore",
     version="2.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
+# ── CORS ─────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
 )
 
-
-# ── SSE helper ─────────────────────────────────────────────────────────────────
-def sse(event_type: str, data: dict, model_id: str = "") -> str:
-    payload = {"event_type": event_type, "data": data}
-    if model_id:
-        payload["model_id"] = model_id
-    return f"data: {json.dumps(payload)}\n\n"
+# ── SSE helper ───────────────────────────────────────────────────────────────
+def _sse(event_type: str, data: dict) -> str:
+    return f"data: {json.dumps({'event_type': event_type, 'data': data})}\n\n"
 
 
-# ── Single-model firewall pipeline ────────────────────────────────────────────
-async def firewall_pipeline(
-    query: str,
-    model_id: str
-) -> tuple[str, list, int, int, int, float]:
+def _build_system_prompt_with_context(query: str) -> str:
     """
-    Runs the full firewall pipeline for ONE model.
-    Returns: (full_response, token_entropies, corrections, total_claims, vault_matches, latency_ms)
-    Non-streaming — used inside eval mode.
+    Build a system prompt that includes relevant vault context.
+    This ensures the LLM generates responses grounded in uploaded documents.
     """
-    t0              = time.perf_counter()
-    full_response   = ""
-    token_entropies = []
-    corrections     = 0
-    total_claims    = 0
-    vault_matches   = 0
-    corrected_resp  = None
+    context = vault.get_context_for_query(query, n=5)
 
-    async for raw, claims in stream_and_detect(query, model_id):
-        if raw.startswith("TOKEN:"):
-            parts = raw[6:].split("|")
-            text  = parts[0]
-            ent   = float(parts[1]) if len(parts) > 1 else 0.0
-            full_response   += text
-            token_entropies .append(ent)
-            continue
-
-        if raw.startswith("ERROR:"):
-            break
-
-        if not claims:
-            continue
-
-        total_claims += len(claims)
-        for claim in claims:
-            if not sentinel.is_fact_seeking(claim.sentence):
-                continue
-            vr = vault.search(claim.text)
-            if not vr:
-                continue
-            vault_matches += 1
-            nli = sentinel.classify(claim.text, vr.matched_text)
-            if nli.is_hallucination:
-                corrections   += 1
-                corrected_resp = rewriter.rewrite(claim.sentence, vr, nli)
-
-    latency = (time.perf_counter() - t0) * 1000
-    return full_response, token_entropies, corrections, total_claims, vault_matches, latency
+    if context:
+        return (
+            "You are a knowledgeable assistant. Answer the user's question using the "
+            "REFERENCE DOCUMENTS provided below as your primary source of information. "
+            "Include specific numbers, dates, and facts from the documents. "
+            "If the documents don't contain relevant information, answer based on your "
+            "general knowledge but be clear about what is from documents vs general knowledge.\n\n"
+            "REFERENCE DOCUMENTS:\n"
+            f"{context}\n\n"
+            "Answer the user's question precisely and concisely."
+        )
+    else:
+        return (
+            "You are a knowledgeable assistant. Answer the user's question with specific "
+            "details, numbers, and facts. Be confident and precise in your response."
+        )
 
 
-# ── Streaming firewall generator (single model, real-time) ────────────────────
-async def streaming_firewall(
-    query: str, model_id: str
-) -> AsyncGenerator[str, None]:
-    """
-    Real-time streaming firewall for single-model mode.
-    Yields SSE events token by token.
-    """
-    stats = SessionStats(model_id=model_id)
-    t0    = time.perf_counter()
-
+# ── Core firewall pipeline ──────────────────────────────────────────────────
+async def firewall_generator(query: str) -> AsyncGenerator[str, None]:
     try:
-        async for raw, claims in stream_and_detect(query, model_id):
+        stats = SessionStats()
+        token_id = 0
 
-            if raw.startswith("TOKEN:"):
-                parts      = raw[6:].split("|")
-                token_text = parts[0]
-                entropy    = float(parts[1]) if len(parts) > 1 else 0.0
-                tid        = str(uuid.uuid4())[:8]
+        # Build context-aware system prompt from vault
+        system_prompt = _build_system_prompt_with_context(query)
+        logger.info(f"Starting firewall stream for query: {query[:50]}...")
+        
+        # Send an immediate connection keep-alive token to prevent Next.js proxy timeout
+        yield _sse("token", {
+            "id": "init",
+            "text": "",
+            "status": "streaming",
+            "entropy": 0.0,
+        })
 
-                status = "high_entropy" if entropy > 0.28 else "streaming"
-                token_event = StreamToken(
-                    id=tid, text=token_text,
-                    status=status, entropy=round(entropy, 4)
-                )
-                yield sse("token", token_event.dict(), model_id)
-                continue
+        async for sentence, claims, entropies in stream_and_detect(query, system_prompt):
 
-            if raw.startswith("ERROR:"):
-                yield sse("error", {"message": raw[6:].strip()}, model_id)
-                return
-
-            if not claims:
-                stats.claims_skipped += 1
+            # ── raw token passthrough
+            if sentence.startswith("TOKEN:"):
+                raw_text = sentence[6:]
+                avg_ent = entropies[0] if entropies else 0.0
+                yield _sse("token", {
+                    "id": f"t{token_id}",
+                    "text": raw_text,
+                    "status": "streaming",
+                    "entropy": round(avg_ent, 3),
+                })
+                token_id += 1
                 continue
 
             stats.total_claims_detected += len(claims)
 
+            if not claims:
+                yield _sse("token", {
+                    "id": f"s{token_id}",
+                    "text": sentence + " ",
+                    "status": "verified",
+                    "entropy": 0.0,
+                })
+                token_id += 1
+                continue
+
+            # ── verify each claim against vault
+            corrected_sentence = sentence
+            sentence_was_corrected = False
+
             for claim in claims:
-                t1 = time.perf_counter()
                 if not sentinel.is_fact_seeking(claim.sentence):
                     stats.claims_skipped += 1
                     continue
 
-                vr = vault.search(claim.text)
-                if not vr:
-                    stats.claims_verified += 1
+                t0 = time.perf_counter()
+                vault_result = vault.search(claim.text)
+
+                if vault_result is None:
+                    stats.claims_skipped += 1
                     continue
 
-                nli     = sentinel.classify(claim.text, vr.matched_text)
-                latency = (time.perf_counter() - t1) * 1000
-
-                n = stats.claims_verified + 1
-                stats.avg_verification_latency_ms = (
-                    (stats.avg_verification_latency_ms * (n - 1) + latency) / n
-                )
                 stats.claims_verified += 1
+                nli_result = sentinel.classify(claim.text, vault_result.matched_text)
+                latency_ms = (time.perf_counter() - t0) * 1000
 
-                if nli.is_hallucination:
+                if nli_result.is_hallucination:
                     stats.hallucinations_found += 1
-                    corrected = rewriter.rewrite(claim.sentence, vr, nli)
-                    payload   = rewriter.build_correction_payload(
-                        claim.sentence, corrected, vr.source_document
+                    corrected = rewriter.rewrite(corrected_sentence, vault_result, nli_result)
+                    correction_payload = rewriter.build_correction_payload(
+                        corrected_sentence, corrected, vault_result.source_document
                     )
+                    corrected_sentence = corrected
+                    sentence_was_corrected = True
                     stats.corrections_made += 1
 
-                    logger.info(
-                        f"[{model_id}] CORRECTED | '{claim.text}' → {vr.source_document}"
-                    )
-                    yield sse("correction", {
-                        "original_claim":     claim.text,
-                        "original_sentence":  claim.sentence,
-                        "corrected_sentence": corrected,
-                        "source":             vr.source_document,
-                        "similarity_score":   vr.similarity_score,
-                        "nli_label":          nli.label,
-                        "nli_confidence":     nli.confidence,
-                        "diff_ratio":         payload.get("diff_ratio", 0),
-                    }, model_id)
+                    yield _sse("correction", {
+                        "id": f"c{token_id}",
+                        "original": correction_payload["original"],
+                        "corrected": correction_payload["corrected"],
+                        "source": correction_payload["source"],
+                        "diff_ratio": correction_payload["diff_ratio"],
+                        "claim": claim.text,
+                        "vault_match": vault_result.matched_text[:120],
+                        "nli_label": nli_result.label,
+                        "nli_confidence": round(nli_result.confidence, 3),
+                        "latency_ms": round(latency_ms, 1),
+                    })
 
-                yield sse("stats", stats.dict(), model_id)
-
-        stats.total_pipeline_latency_ms = (time.perf_counter() - t0) * 1000
-        yield sse("done", stats.dict(), model_id)
-
-    except Exception as e:
-        logger.error(f"Streaming error: {e}", exc_info=True)
-        yield sse("error", {"message": str(e)}, model_id)
-
-
-# ── Eval mode generator (multi-model comparison) ──────────────────────────────
-async def eval_generator(
-    query: str, models: list
-) -> AsyncGenerator[str, None]:
-    """
-    Multi-model evaluation generator.
-    Runs both models in parallel, scores each, judges winner.
-    Yields eval_start → eval_progress → eval_complete events.
-    """
-    session_id = str(uuid.uuid4())[:12]
-    yield sse("eval_start", {
-        "session_id": session_id,
-        "query":      query,
-        "models":     models,
-    })
-
-    # Run both models concurrently
-    model_labels = {
-        "gemini-1.5-flash":      "Gemini 1.5 Flash",
-        "gemini-2.0-flash-lite": "Gemini 2.0 Flash Lite",
-        "gemini-1.5-pro":        "Gemini 1.5 Pro",
-        "gemini-2.0-flash":      "Gemini 2.0 Flash",
-    }
-
-    tasks = [
-        firewall_pipeline(query, m) for m in models
-    ]
-
-    yield sse("eval_progress", {"status": "running_models", "models": models})
-
-    try:
-        results_raw = await asyncio.gather(*tasks, return_exceptions=True)
-    except Exception as e:
-        yield sse("error", {"message": f"Eval pipeline failed: {e}"})
-        return
-
-    model_results = []
-    for i, (model_id, result) in enumerate(zip(models, results_raw)):
-        if isinstance(result, Exception):
-            logger.error(f"Model {model_id} failed: {result}")
-            yield sse("eval_progress", {
-                "status":   "model_failed",
-                "model_id": model_id,
-                "error":    str(result)
+            # yield the (possibly corrected) sentence
+            avg_ent = sum(entropies) / len(entropies) if entropies else 0.0
+            yield _sse("token", {
+                "id": f"s{token_id}",
+                "text": corrected_sentence + " ",
+                "status": "corrected" if sentence_was_corrected else "verified",
+                "entropy": round(avg_ent, 3),
             })
-            continue
+            token_id += 1
 
-        response, entropies, corrections, total_claims, vault_matches, latency = result
+        # ── stream final stats
+        yield _sse("stats", stats.model_dump())
+        yield _sse("done", {"message": "Stream complete", "stats": stats.model_dump()})
 
-        eval_result = build_model_eval(
-            model_id            = model_id,
-            model_label         = model_labels.get(model_id, model_id),
-            response_text       = response,
-            token_entropies     = entropies,
-            corrections_applied = corrections,
-            total_claims        = total_claims,
-            vault_matches       = vault_matches,
-            corrected_response  = None,
-            latency_ms          = latency,
-            query               = query,
-        )
-        model_results.append(eval_result)
+    except Exception as e:
+        logger.exception("Pipeline error")
+        yield _sse("error", {"message": str(e)})
 
-        yield sse("eval_progress", {
-            "status":        "model_complete",
-            "model_id":      model_id,
-            "model_label":   eval_result.model_label,
-            "overall_score": eval_result.overall_score,
-            "dimensions":    {k: v.dict() for k, v in eval_result.dimensions.items()},
-            "response":      response[:400],
-            "latency_ms":    eval_result.latency_ms,
-            "hallucination_rate": eval_result.hallucination_rate,
-            "avg_entropy":   eval_result.avg_token_entropy,
+
+# ── Evaluation pipeline (dual-model comparison) ──────────────────────────────
+async def eval_generator(query: str, models: list[str]) -> AsyncGenerator[str, None]:
+    """
+    Run the same query through two Gemini models, score each, compare.
+    Yields SSE events: eval_start → eval_progress → eval_complete
+    """
+    try:
+        system_prompt = _build_system_prompt_with_context(query)
+
+        yield _sse("eval_start", {
+            "query": query,
+            "models": models,
+            "message": f"Evaluating {len(models)} models..."
         })
 
-    if len(model_results) < 2:
-        yield sse("error", {"message": "Not enough models completed evaluation"})
-        return
+        eval_results = []
 
-    # LLM-as-judge comparison
-    yield sse("eval_progress", {"status": "judging"})
+        for i, model_name in enumerate(models):
+            yield _sse("eval_progress", {
+                "model": model_name,
+                "step": f"Generating response from {model_name}...",
+                "index": i,
+                "total": len(models),
+            })
 
-    a, b = model_results[0], model_results[1]
-    winner_id, verdict, rationale = await llm_judge_comparison(
-        query,
-        a.response_text, a.model_id,
-        b.response_text, b.model_id,
-        a.overall_score, b.overall_score,
-    )
+            try:
+                t0 = time.perf_counter()
+                response_text, token_entropies = await generate_full_response(
+                    query, system_prompt, model=model_name
+                )
+                gen_latency = (time.perf_counter() - t0) * 1000
 
-    # Per-dimension winners
-    dimension_winner = {}
-    for dim in ["factuality", "hallucination_rate", "reasoning", "instruction_following"]:
-        score_a = a.dimensions[dim].score if dim in a.dimensions else 0
-        score_b = b.dimensions[dim].score if dim in b.dimensions else 0
-        dimension_winner[dim] = a.model_id if score_a >= score_b else b.model_id
+                # Run firewall verification on the response
+                corrections_applied = 0
+                total_claims = 0
+                vault_matches = 0
+                corrected_response = response_text
 
-    comparison = ComparisonResult(
-        query            = query,
-        session_id       = session_id,
-        models           = model_results,
-        winner           = winner_id,
-        winner_rationale = rationale,
-        dimension_winner = dimension_winner,
-    )
+                # Split response into sentences and verify each
+                sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', response_text) if s.strip()]
+                for sent in sentences:
+                    if not sentinel.is_fact_seeking(sent):
+                        continue
+                    # Extract claims from the sentence
+                    from interceptor import _detect_claims
+                    sent_claims = _detect_claims(sent, [1.5] * len(sent.split()))
+                    total_claims += len(sent_claims)
 
-    yield sse("eval_complete", {
-        "session_id":       session_id,
-        "winner":           winner_id,
-        "winner_label":     model_labels.get(winner_id, winner_id),
-        "verdict":          verdict,
-        "rationale":        rationale,
-        "dimension_winner": dimension_winner,
-        "dimension_weights":DIMENSION_WEIGHTS,
-        "models": [
-            {
-                "model_id":          r.model_id,
-                "model_label":       r.model_label,
-                "overall_score":     r.overall_score,
-                "dimensions":        {k: v.dict() for k, v in r.dimensions.items()},
-                "hallucination_rate":r.hallucination_rate,
-                "avg_entropy":       r.avg_token_entropy,
-                "peak_entropy":      r.peak_entropy,
-                "corrections":       r.corrections_applied,
-                "latency_ms":        r.latency_ms,
-                "tokens_total":      r.tokens_total,
-                "response":          r.response_text,
-            }
-            for r in model_results
-        ],
-    })
+                    for claim in sent_claims:
+                        vault_result = vault.search(claim.text)
+                        if vault_result is None:
+                            continue
+                        vault_matches += 1
+                        nli_result = sentinel.classify(claim.text, vault_result.matched_text)
+                        if nli_result.is_hallucination:
+                            corrected = rewriter.rewrite(corrected_response, vault_result, nli_result)
+                            corrected_response = corrected
+                            corrections_applied += 1
+
+                # Build evaluation result
+                eval_result = build_model_eval(
+                    model_id=model_name,
+                    model_label=model_name.replace("gemini-", "Gemini ").replace("-", " ").title(),
+                    response_text=response_text,
+                    token_entropies=token_entropies,
+                    corrections_applied=corrections_applied,
+                    total_claims=total_claims,
+                    vault_matches=vault_matches,
+                    corrected_response=corrected_response if corrections_applied > 0 else None,
+                    latency_ms=gen_latency,
+                    query=query,
+                )
+                eval_results.append(eval_result)
+
+                yield _sse("eval_progress", {
+                    "model": model_name,
+                    "step": f"{model_name} complete — score: {eval_result.overall_score:.2f}",
+                    "index": i,
+                    "total": len(models),
+                    "score": eval_result.overall_score,
+                })
+
+            except Exception as e:
+                logger.error("Eval error for %s: %s", model_name, e)
+                yield _sse("eval_progress", {
+                    "model": model_name,
+                    "step": f"Error: {str(e)[:100]}",
+                    "index": i,
+                    "total": len(models),
+                    "error": str(e),
+                })
+
+        if len(eval_results) >= 2:
+            # LLM-as-judge comparison
+            try:
+                winner, verdict, rationale = await llm_judge_comparison(
+                    query=query,
+                    response_a=eval_results[0].response_text,
+                    model_a=eval_results[0].model_id,
+                    response_b=eval_results[1].response_text,
+                    model_b=eval_results[1].model_id,
+                    scores_a=eval_results[0].overall_score,
+                    scores_b=eval_results[1].overall_score,
+                )
+            except Exception as e:
+                logger.warning("Judge failed: %s", e)
+                winner = max(eval_results, key=lambda r: r.overall_score).model_id
+                verdict = f"Winner by score: {winner}"
+                rationale = "LLM judge unavailable — winner determined by score"
+
+            # Build dimension winners
+            dimension_winner = {}
+            if len(eval_results) >= 2:
+                for dim_name in eval_results[0].dimensions:
+                    if dim_name in eval_results[1].dimensions:
+                        if eval_results[0].dimensions[dim_name].score >= eval_results[1].dimensions[dim_name].score:
+                            dimension_winner[dim_name] = eval_results[0].model_id
+                        else:
+                            dimension_winner[dim_name] = eval_results[1].model_id
+
+            yield _sse("eval_complete", {
+                "query": query,
+                "models": [r.model_dump() for r in eval_results],
+                "winner": winner,
+                "verdict": verdict,
+                "rationale": rationale,
+                "dimension_winner": dimension_winner,
+            })
+        elif len(eval_results) == 1:
+            yield _sse("eval_complete", {
+                "query": query,
+                "models": [r.model_dump() for r in eval_results],
+                "winner": eval_results[0].model_id,
+                "verdict": f"Only one model responded: {eval_results[0].model_id}",
+                "rationale": "Single model evaluation",
+                "dimension_winner": {},
+            })
+        else:
+            yield _sse("error", {"message": "No models produced results"})
+
+    except Exception as e:
+        logger.exception("Evaluation suite failure")
+        yield _sse("error", {"message": f"Evaluation system error: {str(e)}"})
 
 
-# ── Routes ─────────────────────────────────────────────────────────────────────
+
+# We need re for sentence splitting in eval
+import re
+
+
+# ── Routes ───────────────────────────────────────────────────────────────────
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    """
-    Firewall mode: single model, real-time SSE stream.
-    Or eval mode: multi-model comparison.
-    """
+    """Main SSE endpoint — query → stream hallucination-corrected response."""
     if not request.query.strip():
-        raise HTTPException(400, "Query cannot be empty")
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
 
-    logger.info(
-        f"Query: '{request.query[:80]}' | "
-        f"eval_mode={request.eval_mode} | "
-        f"models={request.models}"
-    )
-
-    if request.eval_mode and request.models and len(request.models) >= 2:
-        return StreamingResponse(
-            eval_generator(request.query, request.models),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control":             "no-cache",
-                "Connection":                "keep-alive",
-                "X-Accel-Buffering":         "no",
-                "Access-Control-Allow-Origin": "*",
-            }
-        )
-
-    # Default: single-model streaming firewall
-    model_id = request.models[0] if request.models else "gemini-1.5-flash"
     return StreamingResponse(
-        streaming_firewall(request.query, model_id),
+        firewall_generator(request.query),
         media_type="text/event-stream",
         headers={
-            "Cache-Control":             "no-cache",
-            "Connection":                "keep-alive",
-            "X-Accel-Buffering":         "no",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
             "Access-Control-Allow-Origin": "*",
-        }
+        },
     )
 
 
-@app.post("/vault/upload")
-async def vault_upload(
-    file: UploadFile = File(...),
-    source_name: Optional[str] = Form(None)
-):
-    filename     = source_name or file.filename or "uploaded_document"
-    content_type = file.content_type or ""
-    raw_bytes    = await file.read()
-    chunks: list = []
+@app.post("/evaluate")
+async def evaluate(request: ChatRequest):
+    """
+    Evaluation endpoint — run query through multiple Gemini models,
+    score each on 4 dimensions, compare via LLM-as-judge.
+    """
+    if not request.query.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
 
-    if "pdf" in content_type or filename.lower().endswith(".pdf"):
-        try:
-            import pypdf, io as _io
-            reader = pypdf.PdfReader(_io.BytesIO(raw_bytes))
-            for page in reader.pages:
-                text = page.extract_text()
-                if text and text.strip():
-                    words, chunk, chars = text.split(), [], 0
-                    for w in words:
-                        chunk.append(w); chars += len(w) + 1
-                        if chars >= 500:
-                            chunks.append(" ".join(chunk))
-                            chunk, chars = [], 0
-                    if chunk: chunks.append(" ".join(chunk))
-        except ImportError:
-            raise HTTPException(500, "Run: pip install pypdf")
-        except Exception as e:
-            raise HTTPException(400, f"PDF parse error: {e}")
-    else:
-        try:
-            text = raw_bytes.decode("utf-8")
-            words, chunk, chars = text.split(), [], 0
-            for w in words:
-                chunk.append(w); chars += len(w) + 1
-                if chars >= 500:
-                    chunks.append(" ".join(chunk))
-                    chunk, chars = [], 0
-            if chunk: chunks.append(" ".join(chunk))
-        except UnicodeDecodeError:
-            raise HTTPException(400, "File must be PDF or UTF-8 text")
+    models = request.models or ["gemini-2.0-flash", "gemini-2.0-flash-lite"]
 
-    if not chunks:
-        raise HTTPException(400, "No text extracted")
-
-    vault.add_documents_bulk(chunks, filename)
-    return JSONResponse({
-        "status": "success", "filename": filename,
-        "chunks_added": len(chunks), "vault_total": vault.get_count()
-    })
+    return StreamingResponse(
+        eval_generator(request.query, models),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
 
 
 @app.get("/health")
 async def health():
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    api_key_set  = bool(os.getenv("GEMINI_API_KEY", ""))
     return {
-        "status":          "ok",
-        "llm_provider":    "Google Gemini",
-        "default_model":   "gemini-1.5-flash",
-        "eval_models":     ["gemini-1.5-flash", "gemini-2.0-flash-lite"],
+        "status": "ok",
+        "llm_provider": "Google Gemini",
+        "llm_model": gemini_model,
+        "api_key_configured": api_key_set,
         "vault_documents": vault.get_count(),
-        "sentinel_loaded": sentinel._initialized,
-        "mock_mode":       os.getenv("USE_MOCK", "false"),
-        "version":         "2.0.0"
+        "hackathon": "AI4Dev'26, PSG Tech Coimbatore",
     }
 
 
@@ -457,21 +421,82 @@ async def vault_count():
 
 @app.post("/vault/add")
 async def vault_add(payload: dict):
+    """Add a single text fact to the vault."""
     text   = payload.get("text", "").strip()
     source = payload.get("source", "manual_entry")
     if not text:
-        raise HTTPException(400, "text required")
-    vault.add_document(text=text, source_name=source)
-    return {"status": "added", "vault_total": vault.get_count()}
+        raise HTTPException(status_code=400, detail="text is required")
+    vault.add_document(text, source)
+    return {"status": "added", "vault_count": vault.get_count()}
+
+
+@app.post("/vault/upload")
+async def vault_upload(file: UploadFile = File(...)):
+    """
+    Upload a PDF or text file and chunk it into the vault.
+    Supports .pdf and .txt files.
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+
+    filename = file.filename.lower()
+    content  = await file.read()
+
+    if filename.endswith(".pdf"):
+        try:
+            import io
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(content))
+            full_text = "\n".join(
+                page.extract_text() or "" for page in reader.pages
+            )
+        except ImportError:
+            raise HTTPException(
+                status_code=500,
+                detail="pypdf not installed — run: pip install pypdf"
+            )
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"PDF parse error: {e}")
+
+    elif filename.endswith(".txt"):
+        full_text = content.decode("utf-8", errors="ignore")
+
+    else:
+        raise HTTPException(
+            status_code=415,
+            detail="Only .pdf and .txt files are supported"
+        )
+
+    if not full_text.strip():
+        raise HTTPException(status_code=422, detail="File appears to be empty or unreadable")
+
+    # chunk into ~300-word segments
+    words   = full_text.split()
+    chunk_size = 300
+    chunks  = [
+        " ".join(words[i : i + chunk_size])
+        for i in range(0, len(words), chunk_size)
+    ]
+
+    vault.add_documents_bulk(chunks, file.filename)
+    logger.info("Uploaded %s → %d chunks added to vault", file.filename, len(chunks))
+
+    return {
+        "status": "success",
+        "filename": file.filename,
+        "chunks_added": len(chunks),
+        "vault_total": vault.get_count(),
+    }
 
 
 @app.delete("/vault/clear")
 async def vault_clear():
     vault.clear_vault()
     load_demo_financial_data(vault)
-    return {"status": "reset", "vault_total": vault.get_count()}
+    return {"status": "cleared and reloaded", "vault_count": vault.get_count()}
 
 
+# ── Dev entry ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

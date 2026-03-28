@@ -13,7 +13,7 @@ class ChatRequest(BaseModel):
     query: str = Field(..., description="User query")
     session_id: Optional[str] = None
     models: Optional[List[str]] = Field(
-        default=["gemini-1.5-flash", "gemini-2.0-flash-lite"],
+        default=["gemini-2.0-flash", "gemini-2.0-flash-lite"],
         description="Models to evaluate against each other"
     )
     eval_mode: bool = Field(

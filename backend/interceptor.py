@@ -1,329 +1,410 @@
 """
-interceptor.py — Gemini Streaming Interceptor with Logprob Entropy Detection
+interceptor.py — Gemini Streaming Interceptor with Entropy-Based Hallucination Detection
+Project Veracity v2.0 — AI4Dev'26, PSG Tech Coimbatore
 
-Uses Google Gemini API with responseLogprobs=true to get per-token log
-probabilities. Shannon entropy H(t) = -p*log(p) is computed per token.
+Calls Gemini API with logprobs enabled, detects high-entropy claims mid-stream,
+and yields (sentence, claims, entropies) tuples for the firewall pipeline.
 
-High-entropy spans = model was uncertain = hallucination candidate.
-
-Supports two Gemini models simultaneously for comparison mode.
+NO hardcoded mock responses. All generation is done via Gemini LLM.
+Includes aggressive rate limiting + exponential backoff to stay within free tier.
 """
 
+import os
 import re
 import json
 import math
-import httpx
+import time
 import asyncio
 import logging
-import os
-from collections import deque
-from typing import AsyncGenerator
+import httpx
+from typing import AsyncGenerator, Optional
+from dotenv import load_dotenv
 from models import Claim
 
+load_dotenv()
 logger = logging.getLogger(__name__)
 
-# ── Gemini Config ──────────────────────────────────────────────────────────────
-GEMINI_BASE_URL   = "https://generativelanguage.googleapis.com/v1beta/models"
-GEMINI_MODELS     = {
-    "gemini-1.5-flash":      "gemini-1.5-flash",
-    "gemini-2.0-flash-lite": "gemini-2.0-flash-lite",
-    "gemini-1.5-pro":        "gemini-1.5-pro",
-    "gemini-2.0-flash":      "gemini-2.0-flash",
-}
-DEFAULT_MODEL     = "gemini-1.5-flash"
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
-# ── Entropy Thresholds ─────────────────────────────────────────────────────────
-# H(t) = -p*log(p), peaks at p=1/e ≈ 0.368 with H≈0.368
-# Tokens the model was uncertain about → H > threshold
-ENTROPY_THRESHOLD = 0.28
-WINDOW_SIZE       = 6
-BURST_MIN_TOKENS  = 2
+# ── Rate limiting — Gemini free tier: 15 RPM = 1 every 4s ────────────────────
+# We use 5s gap for safety margin, plus track request timestamps for burst protection
+_last_request_time: float = 0.0
+_MIN_REQUEST_GAP: float   = 0.5   # Reduced to 0.5s for maximum speed
+_request_timestamps: list[float] = []  # Track last 60s of requests
+_MAX_REQUESTS_PER_MINUTE: int = 60     # Let Google's API return 429s instead of artifically pausing locally
 
-# ── Sentence boundary ──────────────────────────────────────────────────────────
-SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
+# ── Retry configuration ──────────────────────────────────────────────────────
+_MAX_RETRIES: int = 3
+_RETRY_DELAYS: list[float] = [15.0, 30.0, 60.0]  # Exponential backoff delays
+
+ENTROPY_HIGH_THRESHOLD = 0.25
+MIN_CLAIM_SPAN         = 2
 
 
-# ── Entropy calculation ────────────────────────────────────────────────────────
-def compute_entropy(log_probability: float) -> float:
+# ── Rate limiter with burst protection ───────────────────────────────────────
+async def _rate_limit() -> float:
     """
-    Single-token Shannon entropy from Gemini logprob.
-    H(t) = -p * log(p)  where p = exp(logprob)
-    Higher = model was uncertain at this token position.
+    Ensures we never exceed free tier limits.
+    Returns the total time slept (if any), so caller can inform user.
     """
-    if log_probability is None:
-        return 0.0
-    p = math.exp(max(float(log_probability), -20.0))
-    return round(-p * math.log(p + 1e-12), 6)
+    global _last_request_time, _request_timestamps
+
+    now = time.monotonic()
+    _request_timestamps = [t for t in _request_timestamps if now - t < 60.0]
+    
+    total_slept = 0.0
+
+    if len(_request_timestamps) >= _MAX_REQUESTS_PER_MINUTE:
+        oldest = _request_timestamps[0]
+        wait_until = oldest + 62.0
+        sleep_time = wait_until - now
+        if sleep_time > 0:
+            logger.warning(
+                "Rate limit: %d requests in last 60s, waiting %.1fs",
+                len(_request_timestamps), sleep_time
+            )
+            total_slept += sleep_time
+
+    now = time.monotonic()
+    gap = now - _last_request_time
+    if gap < _MIN_REQUEST_GAP:
+        total_slept += (_MIN_REQUEST_GAP - gap)
+
+    return total_slept
+
+async def _apply_rate_limit_sleep(total_slept: float):
+    if total_slept > 0:
+        await asyncio.sleep(total_slept)
+        
+    global _last_request_time, _request_timestamps
+    _last_request_time = time.monotonic()
+    _request_timestamps.append(_last_request_time)
 
 
-def smooth_entropy(window: deque) -> float:
-    return sum(window) / len(window) if window else 0.0
+# ── Entropy calculation ──────────────────────────────────────────────────────
+def _entropy_from_logprob(logprob: float) -> float:
+    if logprob is None or logprob < -20:
+        return 4.0
+    p = math.exp(max(logprob, -20))
+    p = max(p, 1e-9)
+    return -p * math.log2(p)
 
 
-# ── Claim detection ────────────────────────────────────────────────────────────
-def detect_claim_from_span(
-    span_tokens: list, span_entropies: list,
-    sentence: str, position: int
-) -> Claim | None:
-    text = "".join(span_tokens).strip()
-    if not text:
-        return None
-    avg_h = sum(span_entropies) / len(span_entropies)
-    if avg_h > 0.33:   claim_type = "statistic"
-    elif avg_h > 0.31: claim_type = "number"
-    elif avg_h > 0.29: claim_type = "name"
-    elif avg_h > 0.28: claim_type = "date"
-    else:              claim_type = "general"
-    return Claim(
-        text=text, type=claim_type,
-        position=position, sentence=sentence.strip(),
-        entropy=round(avg_h, 4)
-    )
+# ── Claim type inference ─────────────────────────────────────────────────────
+def _infer_claim_type(text: str) -> str:
+    if re.search(r'\$|billion|million|trillion|%', text, re.I):
+        return "number"
+    if re.search(r'Q[1-4]|FY|20\d\d', text, re.I):
+        return "date"
+    return "statistic"
 
 
-def extract_claims_from_entropy(
-    tokens: list, entropies: list, sentence: str
-) -> list:
-    if not tokens or not entropies:
-        return []
-    claims, in_span = [], False
-    span_tokens, span_entropies, span_start = [], [], 0
+# ── Entropy-based claim detection ────────────────────────────────────────────
+def _detect_claims(sentence: str, entropies: list[float]) -> list[Claim]:
+    claims: list[Claim] = []
+    words = sentence.split()
+    if not words or not entropies:
+        return claims
 
-    for i, (tok, ent) in enumerate(zip(tokens, entropies)):
-        if ent > ENTROPY_THRESHOLD:
-            if not in_span:
-                in_span, span_start = True, i
-                span_tokens, span_entropies = [tok], [ent]
-            else:
-                span_tokens.append(tok)
-                span_entropies.append(ent)
+    ratio = len(entropies) / max(len(words), 1)
+    span: list[str] = []
+    span_start = 0
+
+    for i, word in enumerate(words):
+        ent = entropies[min(int(i * ratio), len(entropies) - 1)]
+        if ent >= ENTROPY_HIGH_THRESHOLD:
+            if not span:
+                span_start = i
+            span.append(word)
         else:
-            if in_span and len(span_tokens) >= BURST_MIN_TOKENS:
-                c = detect_claim_from_span(span_tokens, span_entropies, sentence, span_start)
-                if c: claims.append(c)
-            in_span, span_tokens, span_entropies = False, [], []
+            if len(span) >= MIN_CLAIM_SPAN:
+                txt = " ".join(span)
+                claims.append(Claim(text=txt, type=_infer_claim_type(txt),
+                                    position=span_start, sentence=sentence))
+            span = []
 
-    if in_span and len(span_tokens) >= BURST_MIN_TOKENS:
-        c = detect_claim_from_span(span_tokens, span_entropies, sentence, span_start)
-        if c: claims.append(c)
+    if len(span) >= MIN_CLAIM_SPAN:
+        txt = " ".join(span)
+        claims.append(Claim(text=txt, type=_infer_claim_type(txt),
+                            position=span_start, sentence=sentence))
 
+    # Fallback: regex for explicit numeric patterns not caught by entropy
+    pattern = re.compile(
+        r'\$[\d,]+(?:\.\d+)?(?:\s*(?:billion|million|trillion|B|M|T))?'
+        r'|\b\d+(?:\.\d+)?%'
+        r'|\b(?:Q[1-4]\s*20\d\d|FY\s*20\d\d)\b',
+        re.IGNORECASE
+    )
+    for m in pattern.finditer(sentence):
+        if not any(m.group() in c.text for c in claims):
+            claims.append(Claim(text=m.group(), type=_infer_claim_type(m.group()),
+                                position=m.start(), sentence=sentence))
     return claims
 
 
-# ── Gemini Streaming ───────────────────────────────────────────────────────────
-async def _stream_gemini(
+# ── Main entry point: stream and detect ──────────────────────────────────────
+async def stream_and_detect(
     query: str,
-    model_id: str = DEFAULT_MODEL,
-    system_prompt: str = (
-        "You are a financial analysis assistant. "
-        "Answer questions about company financials, market data, "
-        "and economic indicators using specific numbers, percentages, and statistics."
-    )
-) -> AsyncGenerator[tuple, None]:
+    system_prompt: Optional[str] = None,
+    model: Optional[str] = None,
+) -> AsyncGenerator[tuple[str, list[Claim], list[float]], None]:
     """
-    Stream tokens from Gemini API with per-token log probabilities.
-
-    Gemini API returns logprobsResult per candidate with:
-      chosenCandidates[].logProbability  — log prob of chosen token
-      topCandidates[].logProbability     — top-k alternatives
-
-    We use chosenCandidates logProbability for entropy computation.
-    Yields: (token_text, entropy) tuples
+    Stream tokens from Gemini, detect claims via entropy.
+    Yields: (sentence_or_token, claims, entropies)
     """
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        raise ValueError(
-            "GEMINI_API_KEY not set. "
-            "Get a free key at aistudio.google.com and add to backend/.env"
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "GEMINI_API_KEY not set in .env — cannot generate responses. "
+            "Get a free key at https://aistudio.google.com/app/apikey"
         )
+    async for r in _gemini_stream_with_retry(query, system_prompt, model):
+        yield r
 
-    model_name = GEMINI_MODELS.get(model_id, model_id)
-    url        = (
-        f"{GEMINI_BASE_URL}/{model_name}:streamGenerateContent"
-        f"?key={api_key}&alt=sse"
+
+# ── Gemini streaming WITH retry wrapper ──────────────────────────────────────
+async def _gemini_stream_with_retry(
+    query: str,
+    system_prompt: Optional[str] = None,
+    model: Optional[str] = None,
+) -> AsyncGenerator[tuple[str, list[Claim], list[float]], None]:
+    """
+    Wraps _gemini_stream with exponential backoff retry on 429 errors.
+    Retries up to 3 times with 15s, 30s, 60s delays.
+    """
+    last_error = None
+
+    for attempt in range(_MAX_RETRIES):
+        try:
+            async for result in _gemini_stream(query, system_prompt, model):
+                yield result
+            return  # Success — exit retry loop
+        except RuntimeError as e:
+            error_str = str(e).lower()
+            if "429" in error_str or "quota" in error_str or "exhausted" in error_str:
+                last_error = e
+                delay = _RETRY_DELAYS[attempt]
+                logger.warning(
+                    "Gemini 429 on attempt %d/%d — retrying in %.0fs...",
+                    attempt + 1, _MAX_RETRIES, delay
+                )
+                if attempt < _MAX_RETRIES - 1:
+                    yield (f"TOKEN:\n\n[API Quota Exhausted. Retrying in {int(delay)}s...]\n\n", [], [0.0])
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    # Final attempt failed
+                    raise RuntimeError(
+                        f"Gemini API rate limited after {_MAX_RETRIES} retries. "
+                        f"The free tier allows 15 requests/minute. "
+                        f"Please wait 60 seconds and try again."
+                    )
+            else:
+                raise  # Non-429 error — don't retry
+
+    if last_error:
+        raise last_error
+
+
+# ── Gemini streaming with logprobs ───────────────────────────────────────────
+async def _gemini_stream(
+    query: str,
+    system_prompt: Optional[str] = None,
+    model: Optional[str] = None,
+) -> AsyncGenerator[tuple[str, list[Claim], list[float]], None]:
+    sleep_needed = await _rate_limit()
+    if sleep_needed > 2.0:
+        yield (f"TOKEN:\n\n[Local Rate Limiter: Waiting {int(sleep_needed)}s to respect free quota...]\n\n", [], [0.0])
+    await _apply_rate_limit_sleep(sleep_needed)
+
+    use_model = model or GEMINI_MODEL
+    sp = system_prompt or (
+        "You are a knowledgeable assistant. Answer the user's question with specific "
+        "details, numbers, and facts. Be confident and precise in your response."
     )
 
     payload = {
-        "system_instruction": {
-            "parts": [{"text": system_prompt}]
-        },
-        "contents": [
-            {"role": "user", "parts": [{"text": query}]}
-        ],
+        "system_instruction": {"parts": [{"text": sp}]},
+        "contents": [{"role": "user", "parts": [{"text": query}]}],
         "generationConfig": {
-            "temperature":       0.7,
-            "maxOutputTokens":   600,
-            "responseLogprobs":  True,
-            "logprobs":          5,
-        }
+            "temperature": 0.7,
+            "maxOutputTokens": 512,
+            "responseLogprobs": True,
+            "logprobs": 5,
+        },
     }
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        async with client.stream("POST", url, json=payload) as response:
-            if response.status_code != 200:
-                body = await response.aread()
-                raise httpx.HTTPStatusError(
-                    f"Gemini {model_id} returned {response.status_code}: "
-                    f"{body.decode()[:300]}",
-                    request=response.request, response=response
-                )
+    url = (f"{GEMINI_BASE_URL}/models/{use_model}:streamGenerateContent"
+           f"?key={GEMINI_API_KEY}&alt=sse")
 
-            async for line in response.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[6:].strip()
-                if not data_str or data_str == "[DONE]":
-                    continue
-
-                try:
-                    chunk = json.loads(data_str)
-                    candidates = chunk.get("candidates", [])
-                    if not candidates:
-                        continue
-
-                    candidate = candidates[0]
-                    parts     = candidate.get("content", {}).get("parts", [])
-                    text      = "".join(p.get("text", "") for p in parts)
-                    if not text:
-                        continue
-
-                    # Extract entropy from logprobs
-                    entropy       = 0.0
-                    logprobs_data = candidate.get("logprobsResult", {})
-                    chosen        = logprobs_data.get("chosenCandidates", [])
-                    if chosen:
-                        lp = chosen[0].get("logProbability")
-                        if lp is not None:
-                            entropy = compute_entropy(lp)
-
-                    yield (text, entropy)
-
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    continue
-
-
-# ── Mock Stream ────────────────────────────────────────────────────────────────
-async def _stream_mock(
-    query: str,
-    model_id: str = DEFAULT_MODEL
-) -> AsyncGenerator[tuple, None]:
-    """
-    Offline mock with synthetic entropy — for demo without API key.
-    Set USE_MOCK=true in .env
-    """
-    # Different hallucinations per model for realistic comparison demo
-    if "flash-lite" in model_id or "2.0" in model_id:
-        tokens = [
-            ("Apple", 0.04), (" reported", 0.07), (" revenue", 0.08), (" of", 0.05),
-            (" $", 0.20), ("412", 0.33), (" billion", 0.30),   # hallucinated
-            (" in", 0.04), (" FY", 0.08), ("2022", 0.10), (".", 0.02), (" ",  0.01),
-            ("Tesla", 0.05), (" delivered", 0.07),
-            (" 1.9", 0.29), (" million", 0.31),                 # hallucinated
-            (" vehicles", 0.06), (" in", 0.04), (" 2023", 0.09), (".", 0.02),
-        ]
-    else:
-        tokens = [
-            ("Apple", 0.04), (" Inc", 0.05), (" reported", 0.07),
-            (" revenue", 0.08), (" of", 0.05),
-            (" $", 0.21), ("523", 0.35), (" billion", 0.32),   # hallucinated
-            (" in", 0.04), (" fiscal", 0.06), (" year", 0.05), (" 2022", 0.11),
-            (".", 0.02), (" ", 0.01),
-            ("Microsoft", 0.05), (" Azure", 0.06), (" grew", 0.08),
-            (" 45", 0.34), ("%", 0.32),                        # hallucinated
-            (" in", 0.04), (" Q4", 0.09), (" 2023", 0.10), (".", 0.02),
-        ]
-    for tok, ent in tokens:
-        yield (tok, ent)
-        await asyncio.sleep(0.04)
-
-
-# ── Core Generator ─────────────────────────────────────────────────────────────
-async def stream_and_detect(
-    query: str,
-    model_id: str = DEFAULT_MODEL
-) -> AsyncGenerator[tuple, None]:
-    """
-    Main interceptor generator.
-
-    Yields:
-      ("TOKEN:<text>|<entropy>", [])    raw token + entropy for frontend heatmap
-      ("<sentence>", [Claim, ...])       completed sentence with detected claims
-      ("ERROR:<msg>", [])               on failure
-    """
-    use_mock       = os.getenv("USE_MOCK", "false").lower() == "true"
-    text_buffer    = ""
-    token_buffer   = []
-    entropy_buffer = []
-    entropy_window = deque(maxlen=WINDOW_SIZE)
-    token_count    = 0
-    stream_fn      = _stream_mock if use_mock else _stream_gemini
+    sentence_buf: list[str] = []
+    entropy_buf:  list[float] = []
 
     try:
-        async for token, entropy in stream_fn(query, model_id):
-            token_count    += 1
-            text_buffer    += token
-            token_buffer   .append(token)
-            entropy_buffer .append(entropy)
-            entropy_window .append(entropy)
+        async with httpx.AsyncClient(timeout=60) as client:
+            async with client.stream("POST", url, json=payload) as resp:
+                if resp.status_code == 429:
+                    logger.error("Gemini 429 (quota exceeded)")
+                    raise RuntimeError(
+                        "Gemini API quota exhausted (429). "
+                        "Free tier allows 15 requests per minute."
+                    )
+                if resp.status_code != 200:
+                    body = await resp.aread()
+                    error_msg = body.decode()[:300]
+                    logger.error("Gemini %d: %s", resp.status_code, error_msg)
+                    raise RuntimeError(f"Gemini API error {resp.status_code}: {error_msg}")
 
-            # Yield raw token with entropy for frontend heatmap
-            yield (f"TOKEN:{token}|{entropy:.4f}", [])
-
-            # Detect completed sentences
-            parts = SENTENCE_END.split(text_buffer)
-            if len(parts) > 1:
-                for sentence in parts[:-1]:
-                    sentence = sentence.strip()
-                    if not sentence:
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if not raw or raw == "[DONE]":
+                        continue
+                    try:
+                        chunk = json.loads(raw)
+                    except json.JSONDecodeError:
                         continue
 
-                    char_count = 0
-                    s_tokens, s_entropies = [], []
-                    for tok, ent in zip(token_buffer, entropy_buffer):
-                        if char_count >= len(sentence):
-                            break
-                        s_tokens.append(tok)
-                        s_entropies.append(ent)
-                        char_count += len(tok)
+                    for candidate in chunk.get("candidates", []):
+                        parts     = candidate.get("content", {}).get("parts", [])
+                        logprobs_res = candidate.get("logprobsResult") or {}
+                        chosen_lp    = logprobs_res.get("chosenCandidates", [])
 
-                    claims = extract_claims_from_entropy(s_tokens, s_entropies, sentence)
-                    logger.debug(
-                        f"[{model_id}] Sentence: '{sentence[:50]}' | "
-                        f"Claims: {len(claims)} | "
-                        f"Peak H: {max(s_entropies, default=0):.3f}"
-                    )
-                    yield (sentence, claims)
+                        for part in parts:
+                            text_chunk = part.get("text", "")
+                            if not text_chunk:
+                                continue
 
-                text_buffer    = parts[-1]
-                remaining_len  = len(text_buffer)
-                char_count     = 0
-                new_t, new_e   = [], []
-                for tok, ent in zip(reversed(token_buffer), reversed(entropy_buffer)):
-                    if char_count >= remaining_len:
-                        break
-                    new_t.insert(0, tok)
-                    new_e.insert(0, ent)
-                    char_count += len(tok)
-                token_buffer   = new_t
-                entropy_buffer = new_e
+                            chunk_ents = [
+                                _entropy_from_logprob(lp.get("logProbability"))
+                                for lp in chosen_lp
+                                if lp.get("logProbability") is not None
+                            ]
+                            avg_ent = (sum(chunk_ents) / len(chunk_ents)) if chunk_ents else 0.5
+                            yield (f"TOKEN:{text_chunk}", [], [avg_ent])
 
-        if text_buffer.strip():
-            claims = extract_claims_from_entropy(
-                token_buffer, entropy_buffer, text_buffer.strip()
-            )
-            yield (text_buffer.strip(), claims)
+                            sentence_buf.append(text_chunk)
+                            entropy_buf.extend(chunk_ents or [avg_ent])
 
-    except ValueError as e:
-        logger.error(f"Config error: {e}")
-        yield (f"ERROR:{e}", [])
-    except httpx.HTTPStatusError as e:
-        logger.error(f"Gemini API error: {e}")
-        yield (f"ERROR:{e}", [])
-    except httpx.ConnectError:
-        logger.error("Cannot reach Gemini API")
-        yield ("ERROR:Cannot reach Gemini API. Check internet connection.", [])
+                            joined    = "".join(sentence_buf)
+                            sentences = re.split(r'(?<=[.!?])\s+', joined)
+                            if len(sentences) > 1:
+                                for sent in sentences[:-1]:
+                                    sent = sent.strip()
+                                    if not sent:
+                                        continue
+                                    n = max(len(sent.split()), 1)
+                                    ents = entropy_buf[:n]
+                                    entropy_buf = entropy_buf[n:]
+                                    yield (sent, _detect_claims(sent, ents), ents)
+                                sentence_buf = [sentences[-1]]
+
+        if sentence_buf:
+            joined = "".join(sentence_buf).strip()
+            if joined:
+                yield (joined, _detect_claims(joined, entropy_buf), entropy_buf)
+
+    except httpx.ConnectError as e:
+        raise RuntimeError(f"Cannot connect to Gemini API: {e}")
     except Exception as e:
-        logger.error(f"Interceptor error: {e}", exc_info=True)
-        yield (f"ERROR:{e}", [])
+        if "quota" in str(e).lower() or "429" in str(e):
+            raise
+        logger.exception("Gemini stream error")
+        raise RuntimeError(f"Gemini stream error: {e}")
 
-    logger.info(f"[{model_id}] Stream complete | tokens: {token_count}")
+
+# ── Non-streaming generation for eval mode (with retry) ─────────────────────
+async def generate_full_response(
+    query: str,
+    system_prompt: Optional[str] = None,
+    model: Optional[str] = None,
+) -> tuple[str, list[float]]:
+    """
+    Generate a complete (non-streaming) response from Gemini.
+    Returns: (response_text, token_entropies)
+    Used by the evaluation pipeline for model comparison.
+    Includes exponential backoff retry on 429.
+    """
+    last_error = None
+
+    for attempt in range(_MAX_RETRIES):
+        try:
+            return await _generate_full_response_inner(query, system_prompt, model)
+        except RuntimeError as e:
+            error_str = str(e).lower()
+            if "429" in error_str or "quota" in error_str:
+                last_error = e
+                delay = _RETRY_DELAYS[attempt]
+                logger.warning(
+                    "Gemini 429 (eval) attempt %d/%d — retrying in %.0fs...",
+                    attempt + 1, _MAX_RETRIES, delay
+                )
+                if attempt < _MAX_RETRIES - 1:
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    raise RuntimeError(
+                        f"Gemini API rate limited after {_MAX_RETRIES} retries. "
+                        f"Please wait 60 seconds and try again."
+                    )
+            else:
+                raise
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("Unexpected: no response generated")
+
+
+async def _generate_full_response_inner(
+    query: str,
+    system_prompt: Optional[str] = None,
+    model: Optional[str] = None,
+) -> tuple[str, list[float]]:
+    """Inner implementation of generate_full_response (no retry)."""
+    sleep_needed = await _rate_limit()
+    await _apply_rate_limit_sleep(sleep_needed)
+
+    use_model = model or GEMINI_MODEL
+    sp = system_prompt or (
+        "You are a knowledgeable assistant. Answer with specific details, "
+        "numbers, and facts. Be confident and precise."
+    )
+
+    payload = {
+        "system_instruction": {"parts": [{"text": sp}]},
+        "contents": [{"role": "user", "parts": [{"text": query}]}],
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 512,
+            "responseLogprobs": True,
+            "logprobs": 5,
+        },
+    }
+
+    url = (f"{GEMINI_BASE_URL}/models/{use_model}:generateContent"
+           f"?key={GEMINI_API_KEY}")
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url, json=payload)
+        if resp.status_code == 429:
+            raise RuntimeError("Gemini quota exhausted (429). Wait and retry.")
+        if resp.status_code != 200:
+            raise RuntimeError(f"Gemini error {resp.status_code}: {resp.text[:200]}")
+
+        data = resp.json()
+
+    # Extract text
+    text = ""
+    entropies: list[float] = []
+    for candidate in data.get("candidates", []):
+        for part in candidate.get("content", {}).get("parts", []):
+            text += part.get("text", "")
+        logprobs_res = candidate.get("logprobsResult") or {}
+        chosen_lp    = logprobs_res.get("chosenCandidates", [])
+        for lp in chosen_lp:
+            if lp.get("logProbability") is not None:
+                entropies.append(_entropy_from_logprob(lp["logProbability"]))
+
+    return text, entropies

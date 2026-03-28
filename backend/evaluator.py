@@ -26,7 +26,7 @@ from models import EvalDimension, ModelEvalResult
 logger = logging.getLogger(__name__)
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-JUDGE_MODEL     = "gemini-1.5-flash"   # fast model for judging
+JUDGE_MODEL     = "gemini-2.0-flash"   # confirmed available on free tier
 
 
 # ── Reasoning Quality ──────────────────────────────────────────────────────────
@@ -171,7 +171,7 @@ def score_instruction_following(text: str, query: str) -> EvalDimension:
 
 def score_hallucination_rate(
     entropies: list,
-    threshold: float = 0.28
+    threshold: float = 0.25
 ) -> EvalDimension:
     """
     Hallucination rate from token entropy distribution.
@@ -312,27 +312,56 @@ Replace <model_b_id> with exactly: {model_b}"""
         }
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            result = json.loads(text)
-            winner   = result.get("winner", model_a if scores_a >= scores_b else model_b)
-            verdict  = result.get("verdict", "")
-            rationale= result.get("rationale", "")
-            return winner, verdict, rationale
+    # Retry with exponential backoff for rate limiting
+    retry_delays = [10.0, 25.0, 50.0]
+    max_retries = 3
 
-    except Exception as e:
-        logger.warning(f"LLM judge failed: {e} — falling back to score-based")
-        winner = model_a if scores_a >= scores_b else model_b
-        margin = abs(scores_a - scores_b)
-        verdict = (
-            f"{winner} wins by {'narrow' if margin < 0.05 else 'clear'} margin "
-            f"(score: {max(scores_a, scores_b):.2f} vs {min(scores_a, scores_b):.2f})"
-        )
-        return winner, verdict, "Score-based fallback — judge model unavailable"
+    for attempt in range(max_retries):
+        try:
+            # Wait between judge calls to respect rate limit
+            import asyncio
+            await asyncio.sleep(5.0)  # Always wait 5s before judge call
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(url, json=payload)
+
+                if resp.status_code == 429:
+                    if attempt < max_retries - 1:
+                        delay = retry_delays[attempt]
+                        logger.warning(f"LLM judge 429, retrying in {delay}s (attempt {attempt+1})")
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        raise Exception("Rate limited after retries")
+
+                resp.raise_for_status()
+                data = resp.json()
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                result = json.loads(text)
+                winner   = result.get("winner", model_a if scores_a >= scores_b else model_b)
+                verdict  = result.get("verdict", "")
+                rationale= result.get("rationale", "")
+                return winner, verdict, rationale
+
+        except Exception as e:
+            if attempt < max_retries - 1 and ("429" in str(e) or "quota" in str(e).lower()):
+                delay = retry_delays[attempt]
+                logger.warning(f"LLM judge error: {e}, retrying in {delay}s")
+                await asyncio.sleep(delay)
+                continue
+
+            logger.warning(f"LLM judge failed: {e} — falling back to score-based")
+            winner = model_a if scores_a >= scores_b else model_b
+            margin = abs(scores_a - scores_b)
+            verdict = (
+                f"{winner} wins by {'narrow' if margin < 0.05 else 'clear'} margin "
+                f"(score: {max(scores_a, scores_b):.2f} vs {min(scores_a, scores_b):.2f})"
+            )
+            return winner, verdict, "Score-based fallback — judge model unavailable"
+
+    # Final fallback
+    winner = model_a if scores_a >= scores_b else model_b
+    return winner, f"Winner by score: {winner}", "Judge exhausted retries"
 
 
 # ── Full Model Evaluation ──────────────────────────────────────────────────────
@@ -370,7 +399,7 @@ def build_model_eval(
 
     avg_h  = round(sum(token_entropies) / len(token_entropies), 4) if token_entropies else 0.0
     peak_h = round(max(token_entropies), 4) if token_entropies else 0.0
-    h_rate = sum(1 for e in token_entropies if e > 0.28) / max(len(token_entropies), 1)
+    h_rate = sum(1 for e in token_entropies if e > 0.25) / max(len(token_entropies), 1)
 
     return ModelEvalResult(
         model_id            = model_id,

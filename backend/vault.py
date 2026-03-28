@@ -1,6 +1,5 @@
 # vault.py — Ground Truth Vault (ChromaDB Vector Database)
-# Team: Leo | Hackathon: XEN-O-THON 2026
-# YOUR FILE — Data Engineer Role
+# Project Veracity v2.0 — AI4Dev'26, PSG Tech Coimbatore
 
 import chromadb
 from chromadb.config import Settings
@@ -205,6 +204,38 @@ class GroundTruthVault:
             metadata={"hnsw:space": "cosine"}
         )
         logger.info("[Vault] Vault cleared ✓ — fresh start")
+
+
+    # ───────────────────────────────────────────────────
+    # METHOD — get_context_for_query()
+    # Retrieves the top N vault matches for a query
+    # and formats them as context for the Gemini prompt.
+    # This is how uploaded PDFs influence LLM responses.
+    # ───────────────────────────────────────────────────
+    def get_context_for_query(self, query: str, n: int = 5) -> str:
+        if not self._initialized or self.collection.count() == 0:
+            return ""
+
+        claim_embedding = self.embedder.encode(query).tolist()
+        n_results = min(n, self.collection.count())
+        results = self.collection.query(
+            query_embeddings=[claim_embedding],
+            n_results=n_results
+        )
+
+        context_parts = []
+        for i in range(len(results["documents"][0])):
+            doc_text = results["documents"][0][i]
+            source   = results["metadatas"][0][i].get("source", "unknown")
+            distance = results["distances"][0][i]
+            similarity = 1.0 - (distance / 2.0)
+            if similarity >= 0.3:  # lower threshold for context (not verification)
+                context_parts.append(f"[Source: {source}] {doc_text}")
+
+        if not context_parts:
+            return ""
+
+        return "\n\n".join(context_parts)
 
 
     # ───────────────────────────────────────────────────
