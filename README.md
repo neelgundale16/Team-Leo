@@ -1,9 +1,6 @@
 # Project Veracity
 ### Self-Healing Hallucination Firewall
 
-XEN-O-THON 2026 — Team Leo — GTBIT New Delhi  
-Track: AI & Automation (Beyond Wrappers)
-
 ---
 
 ## What It Does
@@ -145,11 +142,3 @@ frontend/veracity-ui/src/
 - Multi-turn conversation with correction memory across turns
 - Exportable correction audit log for enterprise compliance
 - Adaptive entropy threshold calibrated per model and domain
-
----
-
-## Team
-
-Team Leo — XEN-O-THON 2026  
-AI & Automation (Beyond Wrappers)  
-GTBIT New Delhi
