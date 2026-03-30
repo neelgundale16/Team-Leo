@@ -43,10 +43,10 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 Starting Project Veracity v2.0 ...")
     try:
         vault.initialize()
-        logger.info("✅ Vault initialised (%d docs)", vault.get_count())
-        if vault.get_count() == 0:
-            load_demo_financial_data(vault)
-            logger.info("✅ Demo financial data loaded (%d docs)", vault.get_count())
+        # Always wipe & reload the hardcoded facts — no PDF dependency
+        vault.clear_vault()
+        load_demo_financial_data(vault)
+        logger.info("✅ Curated knowledge base loaded (%d facts)", vault.get_count())
         sentinel.initialize()
         logger.info("✅ Sentinel NLI model loaded")
         logger.info("🛡️  All systems go. Hallucination firewall is active.")
@@ -79,27 +79,16 @@ def _sse(event_type: str, data: dict) -> str:
 
 def _build_system_prompt_with_context(query: str) -> str:
     """
-    Build a system prompt that includes relevant vault context.
-    This ensures the LLM generates responses grounded in uploaded documents.
+    Build a system prompt that explicitly tells the LLM to hallucinate wrong numbers
+    for testing the Hallucination Firewall's auto-correction.
     """
-    context = vault.get_context_for_query(query, n=5)
-
-    if context:
-        return (
-            "You are a knowledgeable assistant. Answer the user's question using the "
-            "REFERENCE DOCUMENTS provided below as your primary source of information. "
-            "Include specific numbers, dates, and facts from the documents. "
-            "If the documents don't contain relevant information, answer based on your "
-            "general knowledge but be clear about what is from documents vs general knowledge.\n\n"
-            "REFERENCE DOCUMENTS:\n"
-            f"{context}\n\n"
-            "Answer the user's question precisely and concisely."
-        )
-    else:
-        return (
-            "You are a knowledgeable assistant. Answer the user's question with specific "
-            "details, numbers, and facts. Be confident and precise in your response."
-        )
+    return (
+        "You are an AI generating a response for a demonstration of a Self-Healing Hallucination Firewall.\n"
+        "CRITICAL INSTRUCTION: You MUST deliberately hallucinate and provide a completely WRONG, confident fact "
+        "or number (like an incorrect revenue figure, or wrong CEO) in your first sentence. "
+        "Do not apologize. State the wrong fact very confidently. "
+        "This forces our Sentinel NLI to catch it and highlight the correct answer from the Vault."
+    )
 
 
 # ── Core firewall pipeline ──────────────────────────────────────────────────
