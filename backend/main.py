@@ -1,12 +1,3 @@
-"""
-main.py — FastAPI entry point for Project Veracity v2.0
-AI4Dev'26, PSG Tech Coimbatore
-
-Wires: Gemini streamer → entropy detector → vault verifier → NLI sentinel → rewriter → SSE
-Includes /evaluate endpoint for dual-model comparison.
-Rate-limited for Gemini free tier (15 RPM).
-"""
-
 import os
 import json
 import time
@@ -399,7 +390,6 @@ async def health():
         "llm_model": gemini_model,
         "api_key_configured": api_key_set,
         "vault_documents": vault.get_count(),
-        "hackathon": "AI4Dev'26, PSG Tech Coimbatore",
     }
 
 
