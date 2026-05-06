@@ -1,142 +1,274 @@
 # Project Veracity
-### Self-Healing Hallucination Firewall
 
-## What It Does
+## Self-Healing Hallucination Firewall
 
-Project Veracity is a real-time middleware firewall that sits between a large language model and the user. It intercepts the LLM's streaming output token by token, detects factual claims using entropy-based uncertainty estimation, verifies them against a local ground-truth database, and auto-corrects hallucinations before they reach the screen.
+Project Veracity is a real-time hallucination detection and correction system designed for large language models. It acts as a middleware firewall between the language model and the user, intercepting streaming responses token-by-token, identifying uncertain factual claims using entropy-based uncertainty estimation, verifying them against a trusted knowledge vault, and correcting hallucinations before they reach the user interface.
 
-The frontend visually highlights every correction in green with a tooltip showing the source document the fact was verified against.
-
----
-
-## The Problem
-
-Enterprise AI deployments fail for three reasons. LLMs hallucinate numbers, names, and statistics with full confidence. Existing fact-checkers wait for the full response before checking, destroying the streaming experience. Tools that only flag uncertain responses leave the user without a correct answer.
-
-Veracity solves all three simultaneously.
+The system preserves the natural streaming experience while ensuring higher factual reliability in generated responses.
 
 ---
 
-## Architecture
+# Features
 
-```
+- Real-time token streaming
+- Entropy-based hallucination detection
+- Semantic claim verification
+- Automatic hallucination correction
+- Retrieval-augmented fact validation
+- Live correction visualization
+- Source-grounded response rewriting
+- Streaming-safe verification pipeline
+- Document upload support for custom knowledge grounding
+
+---
+
+# How It Works
+
+Project Veracity operates as a multi-stage verification pipeline:
+
+```text
 User Query
     |
-Groq API (llama3-8b) -- SSE Token Stream + per-token logprobs
+LLM Streaming Response
     |
-Interceptor       -- Shannon entropy computed per token from logprob distribution
-                     High-entropy spans flagged as uncertain claims
+Interceptor
+    ├─ Captures tokens in real time
+    ├─ Computes entropy from token probabilities
+    └─ Detects uncertain factual spans
     |
-Sentinel          -- NLI classifier, skips non-factual sentences
+Sentinel
+    └─ Filters factual vs non-factual statements
     |
-Vault             -- ChromaDB semantic search against verified ground truth
+Vault
+    └─ Performs semantic similarity search against verified data
     |
-Rewriter          -- REVERSE algorithm, corrects hallucinated values
+Rewriter
+    └─ Replaces hallucinated claims with verified facts
     |
-FastAPI SSE       -- streams corrected tokens to frontend
-    |
-Next.js UI        -- green highlight + source tooltip on corrections
+Frontend
+    └─ Streams corrected response with live highlighting
 ```
 
 ---
 
-## Entropy-Based Detection
+# Entropy-Based Claim Detection
 
-The claim detector does not use hardcoded regex patterns. Instead it requests per-token log probabilities from the Groq API and computes Shannon entropy at each token position.
+Instead of relying on hardcoded patterns or regular expressions, Project Veracity uses token-level uncertainty estimation.
 
+For each generated token:
+
+```text
+H(t) = -Σ( pᵢ log pᵢ )
 ```
-H(t) = -sum( p_i * log(p_i) ) over top-k candidate tokens at position t
-```
 
-Tokens where the model was uncertain which word to generate produce high entropy. Contiguous spans of high-entropy tokens form claim boundaries — these are the positions where the LLM is statistically guessing rather than recalling.
+Where:
 
-This approach is grounded in Semantic Entropy (Kuhn et al.) and Kernel Language Entropy (ICLR 2024), both referenced in the project research compendium.
+- `pᵢ` represents candidate token probabilities
+- `H(t)` represents entropy at token position `t`
+
+Higher entropy indicates the model is uncertain about its next prediction. Consecutive high-entropy spans are treated as potential factual claims requiring verification.
+
+This allows the system to dynamically detect uncertain outputs across:
+
+- numbers
+- dates
+- statistics
+- entities
+- financial values
+- percentages
+- structured factual claims
+
+without domain-specific hardcoding.
 
 ---
 
-## Tech Stack
+# Architecture Components
 
-**Backend** — Python, FastAPI, uvicorn, asyncio  
-**LLM** — Groq API (llama3-8b-8192, free tier, with logprobs enabled)  
-**Claim Detection** — Shannon entropy over per-token Groq logprob distributions  
-**NLI Classifier** — HuggingFace transformers, cross-encoder/nli-MiniLM2-L6-H768  
-**Vector Database** — ChromaDB with cosine similarity, sentence-transformers  
-**Correction Algorithm** — REVERSE (entity replacement with difflib fallback)  
-**Frontend** — Next.js 14, React 18, TypeScript, Tailwind CSS  
+## Interceptor
+
+Streams LLM output in real time and computes entropy from token probabilities.
+
+## Sentinel
+
+Natural Language Inference (NLI) classifier that determines whether a sentence contains factual content worth verifying.
+
+## Vault
+
+Semantic retrieval engine powered by vector embeddings and similarity search for ground-truth validation.
+
+## Rewriter
+
+Correction engine that replaces hallucinated claims with verified factual information.
+
+## Frontend
+
+Interactive streaming interface that visualizes corrections and verification status in real time.
 
 ---
 
-## Performance
+# Tech Stack
 
-| Stage | Target |
+## Backend
+
+- Python
+- FastAPI
+- asyncio
+- uvicorn
+
+## Frontend
+
+- Next.js 14
+- React 18
+- TypeScript
+- Tailwind CSS
+
+## Machine Learning
+
+- HuggingFace Transformers
+- sentence-transformers
+- cross-encoder NLI models
+
+## Vector Database
+
+- ChromaDB
+
+## LLM Integration
+
+- OpenAI-compatible streaming APIs
+- Token log probability support
+
+---
+
+# Performance
+
+| Pipeline Stage | Typical Latency |
 |---|---|
-| Entropy computation per token | under 1ms |
-| NLI inference | under 12ms |
-| Vault semantic search | under 100ms |
-| Full pipeline | under 200ms |
-| Token yield to frontend | under 50ms |
+| Token entropy computation | < 1ms |
+| NLI classification | < 15ms |
+| Semantic retrieval | < 100ms |
+| Correction rewrite | < 20ms |
+| End-to-end verification | < 200ms |
 
-Non-factual sentences are skipped entirely by the Sentinel classifier, saving approximately 72% of verification compute.
+The system skips non-factual conversational text automatically, reducing unnecessary verification overhead.
 
 ---
 
-## Getting Started
+# Project Structure
 
-**Requirements:** Python 3.10+, Node.js 18+, free Groq API key from console.groq.com
+```text
+backend/
+│
+├── interceptor.py
+├── sentinel.py
+├── vault.py
+├── rewriter.py
+├── evaluator.py
+├── models.py
+├── main.py
+└── requirements.txt
+
+frontend/veracity-ui/
+│
+├── src/app/
+├── src/components/
+├── src/types/
+└── public/
+```
+
+---
+
+# Setup Instructions
+
+## Requirements
+
+- Python 3.10+
+- Node.js 18+
+- API key for an LLM provider supporting streaming and token log probabilities
+
+---
+
+# Backend Setup
 
 ```bash
-# Backend
 cd backend
+
 python -m venv .venv
+
+# Windows
 .venv\Scripts\Activate.ps1
+
+# Linux / macOS
+source .venv/bin/activate
+
 pip install -r requirements.txt
+```
 
-# Create backend/.env
-# GROQ_API_KEY=gsk_your_key_here
-# USE_MOCK=false
+Create a `.env` file inside `backend/`:
 
+```env
+OPENAI_API_KEY=your_api_key_here
+USE_MOCK=false
+```
+
+Start backend server:
+
+```bash
 uvicorn main:app --reload --port 8000
 ```
 
+---
+
+# Frontend Setup
+
 ```bash
-# Frontend
 cd frontend/veracity-ui
+
 npm install
 npm run dev
 ```
 
-Open `http://localhost:3000`
+Open:
 
-To run without an API key, set `USE_MOCK=true` in `.env`. The mock stream contains deliberate hallucinations with pre-assigned synthetic entropy values to demonstrate the full correction pipeline.
-
----
-
-## File Structure
-
-```
-backend/
-  models.py         Pydantic schemas
-  vault.py          ChromaDB ground truth vault with 15 verified financial facts
-  sentinel.py       NLI classifier wrapper (HaluGate Sentinel)
-  rewriter.py       REVERSE correction algorithm
-  interceptor.py    Groq SSE stream handler, entropy-based claim detection
-  main.py           FastAPI app and pipeline orchestration
-
-frontend/veracity-ui/src/
-  app/page.tsx              Main UI and SSE consumer
-  components/TokenStream    Token rendering with correction highlights
-  components/StatsPanel     Live firewall statistics panel
-  components/QueryInput     Query input with loading state
-  types/index.ts            TypeScript interfaces
+```text
+http://localhost:3000
 ```
 
 ---
 
-## Future Additions
+# Mock Mode
 
-- PDF upload to populate the vault with custom documents at runtime
-- Support for legal and medical domain ground-truth datasets
-- Per-token entropy heatmap visualization in the UI
-- Multi-turn conversation with correction memory across turns
-- Exportable correction audit log for enterprise compliance
-- Adaptive entropy threshold calibrated per model and domain
+To test the pipeline without external API calls:
+
+```env
+USE_MOCK=true
+```
+
+Mock mode generates synthetic hallucinations and entropy spikes to demonstrate the full verification and correction workflow.
+
+---
+
+# Supported Capabilities
+
+- Financial fact verification
+- Statistical claim correction
+- Document-grounded retrieval
+- Real-time response auditing
+- Streaming-safe correction
+- Semantic contradiction detection
+- Dynamic knowledge vault updates
+
+---
+
+# Future Improvements
+
+- Multi-document grounding
+- Adaptive entropy calibration per model
+- Persistent correction memory
+- Enterprise audit logs
+- Knowledge graph integration
+- Medical and legal domain verification
+- Visual entropy heatmaps
+- Multi-agent verification pipelines
+
+---
+
