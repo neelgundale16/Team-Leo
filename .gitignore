@@ -1,6 +1,20 @@
+# Python
 backend/.venv/
-backend/vault_db/
-backend/__pycache__/
-backend/.env
+backend/venv/
+__pycache__/
+*.pyc
+
+# Frontend
 frontend/veracity-ui/node_modules/
 frontend/veracity-ui/.next/
+
+# Env
+.env
+
+# Uploaded docs
+backend/uploaded_docs/
+backend/vault_db/
+
+# OS
+.DS_Store
+Thumbs.db

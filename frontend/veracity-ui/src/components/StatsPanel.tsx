@@ -1,128 +1,117 @@
-'use client';
+'use client'
 
-import { SessionStats } from '@/types';
+import { SessionStats } from '../types'
 
 interface StatsPanelProps {
-  stats: SessionStats | null;
-  isVisible: boolean;
-  isStreaming: boolean;
+  stats: SessionStats | null
+  isVisible: boolean
+  isStreaming: boolean
 }
 
-const PIPELINE_STEPS = [
-  { key: 'interceptor', name: 'Interceptor',    desc: 'Claim boundary detection' },
-  { key: 'sentinel',    name: 'Sentinel',       desc: 'NLI fact classification' },
-  { key: 'vault',       name: 'Vault Search',   desc: 'ChromaDB semantic lookup' },
-  { key: 'rewriter',    name: 'Rewriter',       desc: 'REVERSE auto-correction' },
-];
-
 export default function StatsPanel({ stats, isVisible, isStreaming }: StatsPanelProps) {
-  const haluPct = stats && stats.total_claims_detected > 0
-    ? Math.round((stats.hallucinations_found / stats.total_claims_detected) * 100)
-    : 0;
-
-  const skipPct = stats && stats.total_claims_detected > 0
-    ? Math.round((stats.claims_skipped / stats.total_claims_detected) * 100)
-    : 0;
-
   return (
-    <aside className={`stats-panel ${isVisible ? 'stats-visible' : 'stats-hidden'}`}>
-
-      {/* ── Live Metrics ─────────────────────────── */}
-      <div className="stats-card">
-        <div className="stats-header">
-          <span className="live-dot" />
-          <span className="stats-title">Live Metrics</span>
+    <aside className="stats-panel">
+      {/* Live status card */}
+      <div className="stat-card">
+        <div className="stat-card-title">
+          <span style={{
+            width: 6, height: 6, borderRadius: '50%',
+            background: isStreaming ? 'var(--success)' : 'var(--text-3)',
+            display: 'inline-block',
+            boxShadow: isStreaming ? '0 0 6px var(--success)' : 'none',
+            animation: isStreaming ? 'pulse-dot 1s ease infinite' : 'none',
+          }} />
+          Firewall Status
         </div>
+        <div className="stat-row">
+          <span className="stat-label">State</span>
+          <span className={`stat-value ${isStreaming ? 'green' : 'blue'}`}>
+            {isStreaming ? 'ACTIVE' : 'READY'}
+          </span>
+        </div>
+        <div className="stat-row">
+          <span className="stat-label">Provider</span>
+          <span className="stat-value purple">Gemini</span>
+        </div>
+        <div className="stat-row">
+          <span className="stat-label">Detection</span>
+          <span className="stat-value blue">Entropy</span>
+        </div>
+      </div>
 
-        {stats ? (
-          <>
-            <div className="stats-body">
-              <div className="stat-row">
-                <span className="stat-label">
-                  <span className="stat-label-dot dot-neutral" />
-                  Claims Detected
-                </span>
-                <span className="stat-value">{stats.total_claims_detected}</span>
-              </div>
-              <div className="stat-row">
-                <span className="stat-label">
-                  <span className="stat-label-dot dot-red" />
-                  Corrections Made
-                </span>
-                <span className="stat-value stat-value-red">{stats.corrections_made}</span>
-              </div>
-              <div className="stat-row">
-                <span className="stat-label">
-                  <span className="stat-label-dot dot-green" />
-                  Verified Clean
-                </span>
-                <span className="stat-value stat-value-green">{stats.claims_verified}</span>
-              </div>
-              <div className="stat-row">
-                <span className="stat-label">
-                  <span className="stat-label-dot dot-amber" />
-                  Skipped ({skipPct}%)
-                </span>
-                <span className="stat-value stat-value-amber">{stats.claims_skipped}</span>
-              </div>
-              <div className="stat-row">
-                <span className="stat-label">
-                  <span className="stat-label-dot dot-neutral" />
-                  Avg Verify
-                </span>
-                <span className="stat-value">{stats.avg_verification_latency_ms.toFixed(0)}ms</span>
-              </div>
-              <div className="stat-row">
-                <span className="stat-label">
-                  <span className="stat-label-dot dot-neutral" />
-                  Pipeline Total
-                </span>
-                <span className="stat-value">{stats.total_pipeline_latency_ms.toFixed(0)}ms</span>
-              </div>
-            </div>
-
-            <div className="halu-section">
-              <div className="halu-label-row">
-                <span className="halu-label">Hallucination Rate</span>
-                <span className="halu-pct">{haluPct}%</span>
-              </div>
-              <div className="halu-track">
-                <div className="halu-fill" style={{ width: `${Math.min(100, haluPct)}%` }} />
-              </div>
-            </div>
-          </>
-        ) : (
-          <div className="stats-empty">
-            <p className="stats-empty-text">
-              {isStreaming ? 'Processing…' : 'Stats will appear here after your first query.'}
-            </p>
+      {/* Live metrics */}
+      {isVisible && stats && (
+        <div className="stat-card animate-in">
+          <div className="stat-card-title">
+            📊 Pipeline Metrics
           </div>
-        )}
-      </div>
-
-      {/* ── Pipeline Steps ───────────────────────── */}
-      <div className="pipeline-card">
-        <div className="pipeline-header">
-          <span className="pipeline-title">Pipeline</span>
+          <div className="stat-row">
+            <span className="stat-label">Claims found</span>
+            <span className="stat-value yellow">{stats.total_claims_detected}</span>
+          </div>
+          <div className="stat-row">
+            <span className="stat-label">Verified</span>
+            <span className="stat-value green">{stats.claims_verified}</span>
+          </div>
+          <div className="stat-row">
+            <span className="stat-label">Hallucinations</span>
+            <span className={`stat-value ${stats.hallucinations_found > 0 ? 'red' : 'green'}`}>
+              {stats.hallucinations_found}
+            </span>
+          </div>
+          <div className="stat-row">
+            <span className="stat-label">Corrections</span>
+            <span className={`stat-value ${stats.corrections_made > 0 ? 'red' : 'green'}`}>
+              {stats.corrections_made}
+            </span>
+          </div>
+          <div className="stat-row">
+            <span className="stat-label">Skipped</span>
+            <span className="stat-value blue">{stats.claims_skipped}</span>
+          </div>
         </div>
-        <div className="pipeline-steps">
-          {PIPELINE_STEPS.map((step) => {
-            const active = isStreaming || !!stats;
-            return (
-              <div key={step.key} className="pipeline-step">
-                <div className={`step-dot ${active ? 'step-dot-active' : 'step-dot-idle'}`}>
-                  {active ? '✓' : '○'}
-                </div>
-                <div>
-                  <div className="step-name">{step.name}</div>
-                  <div className="step-desc">{step.desc}</div>
-                </div>
-              </div>
-            );
-          })}
+      )}
+
+      {/* Latency */}
+      {isVisible && stats && (
+        <div className="stat-card animate-in">
+          <div className="stat-card-title">⚡ Latency</div>
+          <div className="stat-row">
+            <span className="stat-label">Avg verify</span>
+            <span className="stat-value green">
+              {stats.avg_verification_latency_ms.toFixed(1)}ms
+            </span>
+          </div>
+          {stats.total_pipeline_latency_ms > 0 && (
+            <div className="stat-row">
+              <span className="stat-label">Pipeline total</span>
+              <span className="stat-value blue">
+                {stats.total_pipeline_latency_ms.toFixed(0)}ms
+              </span>
+            </div>
+          )}
+          <div className="stat-row">
+            <span className="stat-label">Target</span>
+            <span className="stat-value purple">&lt;200ms</span>
+          </div>
+        </div>
+      )}
+
+      {/* Info card */}
+      <div className="stat-card">
+        <div className="stat-card-title">ℹ️ How It Works</div>
+        <div style={{ fontSize: '0.72rem', color: 'var(--text-3)', lineHeight: 1.6 }}>
+          <p style={{ marginBottom: 6 }}>
+            Per-token Shannon entropy from Gemini logprobs flags uncertain spans.
+          </p>
+          <p style={{ marginBottom: 6 }}>
+            NLI classifier verifies flagged claims against the ground truth vault.
+          </p>
+          <p>
+            Contradictions trigger the REVERSE rewriter before reaching your screen.
+          </p>
         </div>
       </div>
-
     </aside>
-  );
+  )
 }
