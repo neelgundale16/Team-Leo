@@ -1,6 +1,3 @@
-# vault.py — Ground Truth Vault (ChromaDB Vector Database)
-# Project Veracity v2.0 — AI4Dev'26, PSG Tech Coimbatore
-
 import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
@@ -11,9 +8,7 @@ import io
 from pypdf import PdfReader
 import logging
 
-# ─────────────────────────────────────────────
-# CONSTANTS — never hardcode these anywhere else
-# ─────────────────────────────────────────────
+
 VAULT_PATH           = "./vault_db"
 COLLECTION_NAME      = "ground_truth_vault"
 EMBEDDING_MODEL      = "all-MiniLM-L6-v2"
@@ -367,12 +362,6 @@ class GroundTruthVault:
         logger.info(f"[Vault] {len(pdfs)} PDFs found in upload folder")
         return pdfs
 
-
-# ═══════════════════════════════════════════════════════
-# FUNCTION: load_demo_financial_data()
-# Seeds the vault with 10 real financial facts
-# Called once at startup for the hackathon demo
-# ═══════════════════════════════════════════════════════
 def load_demo_financial_data(vault: GroundTruthVault):
     logger.info("[Vault] Loading demo financial facts...")
 
